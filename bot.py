@@ -43,7 +43,7 @@ def save_map():
 
 def tmux_send(window: int, text: str) -> None:
     subprocess.run(
-        ["tmux", "send-keys", "-t", f"{TMUX_SESSION}:{window}", text, "Enter"],
+        ["tmux", "send-keys", "-t", f"{TMUX_SESSION}:{window}", "--", text, "Enter"],
         check=True,
     )
 
@@ -173,7 +173,7 @@ async def on_message(message: discord.Message):
         content = message.content.strip()
 
         if content == "!enter":
-            subprocess.run(["tmux", "send-keys", "-t", f"{TMUX_SESSION}:{window}", "Enter"])
+            subprocess.run(["tmux", "send-keys", "-t", f"{TMUX_SESSION}:{window}", "--", "Enter"])
             await asyncio.sleep(0.5)
             out = truncate(tmux_capture(window))
             await message.reply(f"```\n{out}\n```")
@@ -181,7 +181,7 @@ async def on_message(message: discord.Message):
 
         if content.startswith("!key "):
             key = content[5:].strip()
-            subprocess.run(["tmux", "send-keys", "-t", f"{TMUX_SESSION}:{window}", key])
+            subprocess.run(["tmux", "send-keys", "-t", f"{TMUX_SESSION}:{window}", "--", key])
             await asyncio.sleep(0.5)
             out = truncate(tmux_capture(window))
             await message.reply(f"```\n{out}\n```")
@@ -220,9 +220,9 @@ async def on_message(message: discord.Message):
         except subprocess.CalledProcessError as e:
             await message.reply(f"エラー: {e}")
             return
-        thinking = await message.reply("⏳")
+        await message.reply("⏳")
         out = await wait_stable(window)
-        await thinking.edit(content=f"```\n{truncate(out)}\n```")
+        await message.reply(f"```\n{truncate(out)}\n```")
         return
 
     # ── メインチャンネル内メッセージ ─────────────────────────
