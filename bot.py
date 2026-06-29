@@ -7,7 +7,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 TOKEN = os.getenv("DISCORD_TOKEN")
-ALLOWED_CHANNEL = os.getenv("DISCORD_CHANNEL_ID")  # 空なら全チャンネル許可
+ALLOWED_CHANNEL = os.getenv("DISCORD_CHANNEL_ID") or None  # 空なら全チャンネル許可
 TMUX_SESSION = os.getenv("TMUX_SESSION", "0")
 
 intents = discord.Intents.default()
@@ -61,6 +61,28 @@ def tmux_windows() -> list[dict]:
     return windows
 
 
+ENV_PATH = os.path.join(os.path.dirname(__file__), ".env")
+
+
+def save_channel(channel_id: str) -> None:
+    lines = []
+    found = False
+    try:
+        with open(ENV_PATH) as f:
+            for line in f:
+                if line.startswith("DISCORD_CHANNEL_ID="):
+                    lines.append(f"DISCORD_CHANNEL_ID={channel_id}\n")
+                    found = True
+                else:
+                    lines.append(line)
+    except FileNotFoundError:
+        pass
+    if not found:
+        lines.append(f"DISCORD_CHANNEL_ID={channel_id}\n")
+    with open(ENV_PATH, "w") as f:
+        f.writelines(lines)
+
+
 def is_allowed(message: discord.Message) -> bool:
     if message.author.bot:
         return False
@@ -95,6 +117,14 @@ async def on_message(message: discord.Message):
         return
 
     content = message.content.strip()
+
+    # ── !setchannel : このチャンネルに固定 ───────────────────
+    if content == "!setchannel":
+        global ALLOWED_CHANNEL
+        ALLOWED_CHANNEL = str(message.channel.id)
+        save_channel(ALLOWED_CHANNEL)
+        await message.reply(f"このチャンネル（{message.channel.id}）に固定しました。")
+        return
 
     # ── !windows : ウィンドウ一覧 ─────────────────────────────
     if content in ("!windows", "!w"):
