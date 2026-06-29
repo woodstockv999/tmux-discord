@@ -122,46 +122,57 @@ def is_idle(raw: str) -> bool:
 def extract_final_result(raw: str) -> str:
     """
     tmuxキャプチャからClaude Codeの最終応答テキストのみを抽出。
-    - ANSI除去
-    - 末尾プロンプト行を除去
-    - 下から走査し、ツール呼び出し行に当たったらそこで打ち切り
+    ● で始まる応答ブロックを前向きスキャンし、最後のブロックを返す。
+    ● がなければ bash 出力として旧ロジックにフォールバック。
     """
     clean = strip_ansi(raw)
-    # Claude Code UI装飾（区切り線・ステータスバー・プロンプト行）を除去
-    lines = [l for l in clean.splitlines()
-             if not CHROME_RE.search(l) and not PROMPT_RE.match(l.strip())]
+    lines = clean.splitlines()
 
-    # 末尾の空行を除去
+    # Claude Code モード: ● 応答ブロックを前向きスキャン（最後のものを採用）
+    result_lines: list[str] = []
+    in_response = False
+    for line in lines:
+        s = line.strip()
+        if s.startswith('●'):
+            result_lines = [s[1:].strip()]  # ● を除去して新ブロック開始
+            in_response = True
+        elif in_response:
+            # ✻ (タイマー) / ⏺ (ツール呼び出し) / ❯ (プロンプト) で終了
+            if s.startswith(('✻', '⏺', '❯', '⎿')) or CHROME_RE.search(line):
+                in_response = False
+            else:
+                result_lines.append(line.rstrip())
+
+    if result_lines:
+        while result_lines and not result_lines[-1].strip():
+            result_lines.pop()
+        result = '\n'.join(result_lines).strip()
+        if result:
+            return truncate(result)
+
+    # Bash フォールバック: UI除去後に末尾ブロックを逆走査
+    lines = [l for l in lines if not CHROME_RE.search(l) and not PROMPT_RE.match(l.strip())]
     while lines and not lines[-1].strip():
         lines.pop()
-
     if not lines:
         return ""
 
-    # 下から走査して最後の「ツール非呼び出し」ブロックを取得
-    result_lines: list[str] = []
+    result_lines = []
     for line in reversed(lines):
         stripped = line.strip()
         if TOOL_RE.search(stripped) or PROMPT_RE.match(stripped):
             if result_lines:
-                break  # ツール行を超えた → ここまでが最終ブロック
+                break
         else:
             result_lines.insert(0, line)
 
-    # 先頭の空行を除去
     while result_lines and not result_lines[0].strip():
         result_lines.pop(0)
 
     result = "\n".join(result_lines).strip()
-
-    # 抽出できなければ全体をフォールバック
     if not result:
-        fallback = "\n".join(lines).strip()
-        return truncate(fallback)
-
-    if len(result) > 1800:
-        result = "...(省略)...\n" + result[-1800:]
-    return result
+        return truncate('\n'.join(lines))
+    return truncate(result)
 
 
 # ── 完了待機 ──────────────────────────────────────────────────
