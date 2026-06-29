@@ -101,13 +101,20 @@ def truncate(text: str, limit: int = 1800) -> str:
 def is_idle(raw: str) -> bool:
     """
     Claude Code / シェルがアイドル状態か判定。
-    - ANSI除去後に処理中サイン（Undulating等）がなく
-    - かつ ❯ または $ プロンプトが含まれていれば idle とみなす
+    最後の非空行がプロンプト行（Claude Code: ❯ / bash: path$）かつ
+    全体に処理中サインがなければ idle とみなす。
     """
     clean = strip_ansi(raw)
-    if CLAUDE_BUSY_RE.search(clean):
+    lines = [l for l in clean.splitlines() if l.strip()]
+    if not lines:
         return False
-    return bool(re.search(r'^\s*[❯>$#%]\s*$', clean, re.MULTILINE))
+    last = lines[-1]
+    # Claude Code prompt（❯ のみ）または bash prompt（末尾が $ or #）
+    if not re.search(r'^\s*[❯>$#%]\s*$|[#$]\s*$', last):
+        return False
+    # 最終行以外に処理中サインがあれば busy
+    preceding = '\n'.join(lines[:-1])
+    return not CLAUDE_BUSY_RE.search(preceding)
 
 
 def extract_final_result(raw: str) -> str:
@@ -176,8 +183,8 @@ async def wait_for_completion(window: int, timeout: int = 300) -> str:
             stable = 0
             prev = cur
 
-        # 3秒間変化なし + プロンプト行で終わっていれば完了
-        if stable >= 6 and is_idle(cur):
+        # アイドル判定は現在画面のみ（scrollback の古い ⎿  $ を除外するため）
+        if stable >= 6 and is_idle(tmux_capture(window)):
             return cur
 
     return prev
