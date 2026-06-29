@@ -28,6 +28,8 @@ TOOL_RE = re.compile(r'[⏺✓✗⚡◆▶]|^\s*(?:Bash|Read|Edit|Write|Search|G
 PROMPT_RE = re.compile(r'^\s*[>$#%❯]\s*$|.+[#$]\s*$')
 # Claude Code が処理中であることを示すパターン
 CLAUDE_BUSY_RE = re.compile(r'Undulating|Working|Running|Thinking|\d+s\s*·|⎿\s*\$')
+# Claude Code UI の装飾要素（区切り線・ステータスバー）
+CHROME_RE = re.compile(r'^[─━═╌╍┈┉\s]+$|⏵⏵|⏺⏺')
 
 
 # ── 永続化 ────────────────────────────────────────────────────
@@ -125,10 +127,12 @@ def extract_final_result(raw: str) -> str:
     - 下から走査し、ツール呼び出し行に当たったらそこで打ち切り
     """
     clean = strip_ansi(raw)
-    lines = clean.splitlines()
+    # Claude Code UI装飾（区切り線・ステータスバー・プロンプト行）を除去
+    lines = [l for l in clean.splitlines()
+             if not CHROME_RE.search(l) and not PROMPT_RE.match(l.strip())]
 
-    # 末尾のプロンプト行・空行を除去
-    while lines and (not lines[-1].strip() or PROMPT_RE.match(lines[-1].strip())):
+    # 末尾の空行を除去
+    while lines and not lines[-1].strip():
         lines.pop()
 
     if not lines:
