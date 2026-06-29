@@ -141,6 +141,8 @@ async def on_ready():
 async def on_message(message: discord.Message):
     global active_window, watch_task, watch_channel, ALLOWED_CHANNEL
 
+    print(f"[msg] {message.author} ch={message.channel.id} content={repr(message.content[:80])}", flush=True)
+
     if not is_allowed(message):
         return
 
@@ -294,6 +296,13 @@ async def on_message(message: discord.Message):
         out = truncate(tmux_capture(active_window))
         await message.reply(f"```\n[w{active_window}] $ {cmd}\n{out}\n```")
         return
+
+
+@client.event
+async def on_error(event, *args, **kwargs):
+    import traceback
+    print(f"[error] event={event}", flush=True)
+    traceback.print_exc()
 
 
 client.run(TOKEN)
