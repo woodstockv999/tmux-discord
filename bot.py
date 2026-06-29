@@ -17,7 +17,7 @@ intents.message_content = True
 client = discord.Client(intents=intents)
 
 # thread_id(str) → window_index(int)
-MAPPING_FILE = os.path.join(os.path.dirname(__file__), "thread_map.json")
+MAPPING_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "thread_map.json")
 thread_map: dict[str, int] = {}
 
 watch_tasks: dict[int, asyncio.Task] = {}  # window_index → Task
@@ -113,7 +113,7 @@ async def watch_loop(window: int, thread: discord.Thread):
 
 # ── .env save ─────────────────────────────────────────────────
 
-ENV_PATH = os.path.join(os.path.dirname(__file__), ".env")
+ENV_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
 
 
 def save_env(key: str, value: str) -> None:
@@ -164,6 +164,8 @@ async def on_message(message: discord.Message):
 
     if message.author.bot:
         return
+
+    print(f"[msg] {message.author} ch={message.channel.id} type={type(message.channel).__name__} content={repr(message.content[:60])}", flush=True)
 
     # ── スレッド内メッセージ ──────────────────────────────────
     window = get_thread_window(message)
