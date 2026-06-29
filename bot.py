@@ -101,20 +101,20 @@ def truncate(text: str, limit: int = 1800) -> str:
 def is_idle(raw: str) -> bool:
     """
     Claude Code / シェルがアイドル状態か判定。
-    最後の非空行がプロンプト行（Claude Code: ❯ / bash: path$）かつ
-    全体に処理中サインがなければ idle とみなす。
+    処理中サイン（タイマー等）がなく、末尾10行以内に ❯ 単独行または
+    bash プロンプト行があればアイドルとみなす。
+    ステータスバー（⏵⏵ bypass...）が最終行に来るため末尾N行で判定する。
     """
     clean = strip_ansi(raw)
+    if CLAUDE_BUSY_RE.search(clean):
+        return False
     lines = [l for l in clean.splitlines() if l.strip()]
     if not lines:
         return False
-    last = lines[-1]
-    # Claude Code prompt（❯ のみ）または bash prompt（末尾が $ or #）
-    if not re.search(r'^\s*[❯>$#%]\s*$|[#$]\s*$', last):
-        return False
-    # 最終行以外に処理中サインがあれば busy
-    preceding = '\n'.join(lines[:-1])
-    return not CLAUDE_BUSY_RE.search(preceding)
+    for line in lines[-10:]:
+        if re.search(r'^\s*[❯>$#%]\s*$|[#$]\s*$', line):
+            return True
+    return False
 
 
 def extract_final_result(raw: str) -> str:
