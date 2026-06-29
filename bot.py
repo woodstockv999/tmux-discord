@@ -172,6 +172,21 @@ async def on_message(message: discord.Message):
     if window is not None:
         content = message.content.strip()
 
+        if content == "!enter":
+            subprocess.run(["tmux", "send-keys", "-t", f"{TMUX_SESSION}:{window}", "Enter"])
+            await asyncio.sleep(0.5)
+            out = truncate(tmux_capture(window))
+            await message.reply(f"```\n{out}\n```")
+            return
+
+        if content.startswith("!key "):
+            key = content[5:].strip()
+            subprocess.run(["tmux", "send-keys", "-t", f"{TMUX_SESSION}:{window}", key])
+            await asyncio.sleep(0.5)
+            out = truncate(tmux_capture(window))
+            await message.reply(f"```\n{out}\n```")
+            return
+
         if content == "!cap":
             out = truncate(tmux_capture(window))
             await message.reply(f"```\n{out}\n```")
