@@ -2,6 +2,7 @@ import discord
 import subprocess
 import asyncio
 import os
+import json
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -15,17 +16,34 @@ intents = discord.Intents.default()
 intents.message_content = True
 client = discord.Client(intents=intents)
 
-active_window = 0
-watch_task: asyncio.Task | None = None
-watch_channel: discord.TextChannel | None = None
+# thread_id(str) → window_index(int)
+MAPPING_FILE = os.path.join(os.path.dirname(__file__), "thread_map.json")
+thread_map: dict[str, int] = {}
+
+watch_tasks: dict[int, asyncio.Task] = {}  # window_index → Task
+
+
+# ── 永続化 ────────────────────────────────────────────────────
+
+def load_map():
+    global thread_map
+    try:
+        with open(MAPPING_FILE) as f:
+            thread_map = {k: int(v) for k, v in json.load(f).items()}
+    except (FileNotFoundError, json.JSONDecodeError):
+        thread_map = {}
+
+
+def save_map():
+    with open(MAPPING_FILE, "w") as f:
+        json.dump(thread_map, f)
 
 
 # ── tmux helpers ──────────────────────────────────────────────
 
-def tmux_send(window: int, text: str, enter: bool = True) -> None:
-    keys = [text, "Enter"] if enter else [text]
+def tmux_send(window: int, text: str) -> None:
     subprocess.run(
-        ["tmux", "send-keys", "-t", f"{TMUX_SESSION}:{window}"] + keys,
+        ["tmux", "send-keys", "-t", f"{TMUX_SESSION}:{window}", text, "Enter"],
         check=True,
     )
 
@@ -41,17 +59,15 @@ def tmux_capture(window: int) -> str:
 def tmux_windows() -> list[dict]:
     result = subprocess.run(
         ["tmux", "list-windows", "-t", TMUX_SESSION, "-F",
-         "#{window_index}|#{window_name}|#{window_active}|#{pane_current_command}"],
+         "#{window_index}|#{window_name}|#{pane_current_command}"],
         capture_output=True, text=True,
     )
     windows = []
     for line in result.stdout.strip().splitlines():
-        idx, name, active, cmd = line.split("|")
-        windows.append({"index": int(idx), "name": name, "active": active == "1", "command": cmd})
+        idx, name, cmd = line.split("|")
+        windows.append({"index": int(idx), "name": name, "command": cmd})
     return windows
 
-
-# ── output helpers ────────────────────────────────────────────
 
 def truncate(text: str, limit: int = 1800) -> str:
     lines = text.splitlines()
@@ -63,40 +79,39 @@ def truncate(text: str, limit: int = 1800) -> str:
     return result
 
 
-async def wait_for_stable_output(window: int, timeout: int = 30) -> str:
-    """出力が2秒間変化しなくなるまで待つ（Claude Code等の長い応答対応）"""
+async def wait_stable(window: int, timeout: int = 30) -> str:
+    """出力が2秒変化しなくなるまで待つ"""
     prev = ""
-    stable_count = 0
+    stable = 0
     for _ in range(timeout * 2):
         await asyncio.sleep(0.5)
-        current = tmux_capture(window)
-        if current == prev:
-            stable_count += 1
-            if stable_count >= 4:  # 2秒間変化なし
+        cur = tmux_capture(window)
+        if cur == prev:
+            stable += 1
+            if stable >= 4:
                 break
         else:
-            stable_count = 0
-            prev = current
+            stable = 0
+            prev = cur
     return prev
 
 
 # ── watch loop ────────────────────────────────────────────────
 
-async def watch_loop(window: int, interval: int = 2):
+async def watch_loop(window: int, thread: discord.Thread):
     last = tmux_capture(window)
     while True:
-        await asyncio.sleep(interval)
-        current = tmux_capture(window)
-        if current != last and watch_channel:
-            diff = truncate(current)
+        await asyncio.sleep(2)
+        cur = tmux_capture(window)
+        if cur != last:
             try:
-                await watch_channel.send(f"```\n[w{window}]\n{diff}\n```")
+                await thread.send(f"```\n{truncate(cur)}\n```")
             except Exception:
                 pass
-            last = current
+            last = cur
 
 
-# ── .env helpers ──────────────────────────────────────────────
+# ── .env save ─────────────────────────────────────────────────
 
 ENV_PATH = os.path.join(os.path.dirname(__file__), ".env")
 
@@ -120,7 +135,7 @@ def save_env(key: str, value: str) -> None:
         f.writelines(lines)
 
 
-def is_allowed(message: discord.Message) -> bool:
+def is_main_channel(message: discord.Message) -> bool:
     if message.author.bot:
         return False
     if ALLOWED_CHANNEL and str(message.channel.id) != ALLOWED_CHANNEL:
@@ -128,51 +143,121 @@ def is_allowed(message: discord.Message) -> bool:
     return True
 
 
+def get_thread_window(message: discord.Message) -> int | None:
+    """メッセージがスレッド内なら対応ウィンドウ番号を返す"""
+    if not isinstance(message.channel, discord.Thread):
+        return None
+    return thread_map.get(str(message.channel.id))
+
+
 # ── events ───────────────────────────────────────────────────
 
 @client.event
 async def on_ready():
-    print(f"[tmux-discord] Logged in as {client.user}", flush=True)
-    if ALLOWED_CHANNEL:
-        print(f"[tmux-discord] Restricted to channel {ALLOWED_CHANNEL}", flush=True)
+    load_map()
+    print(f"[tmux-discord] Logged in as {client.user} | {len(thread_map)} thread(s) mapped", flush=True)
 
 
 @client.event
 async def on_message(message: discord.Message):
-    global active_window, watch_task, watch_channel, ALLOWED_CHANNEL
+    global ALLOWED_CHANNEL
 
-    print(f"[msg] {message.author} ch={message.channel.id} content={repr(message.content[:80])}", flush=True)
+    if message.author.bot:
+        return
 
-    if not is_allowed(message):
+    # ── スレッド内メッセージ ──────────────────────────────────
+    window = get_thread_window(message)
+    if window is not None:
+        content = message.content.strip()
+
+        if content == "!cap":
+            out = truncate(tmux_capture(window))
+            await message.reply(f"```\n{out}\n```")
+            return
+
+        if content == "!watch":
+            if window in watch_tasks and not watch_tasks[window].done():
+                await message.reply("すでに監視中です。`!unwatch` で停止。")
+                return
+            watch_tasks[window] = asyncio.create_task(
+                watch_loop(window, message.channel)
+            )
+            await message.reply(f"ウィンドウ {window} の監視を開始しました。")
+            return
+
+        if content == "!unwatch":
+            t = watch_tasks.pop(window, None)
+            if t:
+                t.cancel()
+                await message.reply("監視停止しました。")
+            else:
+                await message.reply("監視は動いていません。")
+            return
+
+        if content.startswith("!"):
+            return  # 未知のコマンドは無視
+
+        # 通常テキスト → tmuxウィンドウへ送信
+        try:
+            tmux_send(window, content)
+        except subprocess.CalledProcessError as e:
+            await message.reply(f"エラー: {e}")
+            return
+        thinking = await message.reply("⏳")
+        out = await wait_stable(window)
+        await thinking.edit(content=f"```\n{truncate(out)}\n```")
+        return
+
+    # ── メインチャンネル内メッセージ ─────────────────────────
+    if not is_main_channel(message):
         return
 
     content = message.content.strip()
 
-    # ── >テキスト : アクティブウィンドウに直接送信（Claude Code等） ──
-    if content.startswith(">") and not content.startswith(">>"):
-        text = content[1:].strip()
-        if not text:
-            return
-        try:
-            tmux_send(active_window, text)
-        except subprocess.CalledProcessError as e:
-            await message.reply(f"エラー: {e}")
-            return
-        # 出力が安定するまで最大30秒待つ
-        thinking = await message.reply("⏳ 応答待ち...")
-        out = await wait_for_stable_output(active_window)
-        await thinking.edit(content=f"```\n[w{active_window}]\n{truncate(out)}\n```")
-        return
-
-    # ── !setchannel ───────────────────────────────────────────
+    # !setchannel
     if content == "!setchannel":
         ALLOWED_CHANNEL = str(message.channel.id)
         save_env("DISCORD_CHANNEL_ID", ALLOWED_CHANNEL)
-        await message.reply(f"このチャンネル（{message.channel.id}）に固定しました。")
+        await message.reply(f"このチャンネルに固定しました。")
         return
 
-    # ── !windows / !w ─────────────────────────────────────────
-    if content in ("!windows", "!w"):
+    # !init : tmuxウィンドウごとにスレッドを作成
+    if content == "!init":
+        try:
+            wins = tmux_windows()
+        except Exception as e:
+            await message.reply(f"tmuxエラー: {e}")
+            return
+
+        created = []
+        for w in wins:
+            name = f"w{w['index']} • {w['name']} [{w['command']}]"
+            # 既存スレッドがあればスキップ
+            existing = next(
+                (tid for tid, idx in thread_map.items() if idx == w["index"]), None
+            )
+            if existing:
+                created.append(f"w{w['index']}: 既存スレッドあり")
+                continue
+            thread = await message.channel.create_thread(
+                name=name[:100],
+                type=discord.ChannelType.public_thread,
+                auto_archive_duration=10080,
+            )
+            thread_map[str(thread.id)] = w["index"]
+            await thread.send(
+                f"**ウィンドウ {w['index']} • `{w['command']}`** に接続しました。\n"
+                f"このスレッドに書くとウィンドウに送信されます。\n"
+                f"`!cap` = 現在画面  `!watch` / `!unwatch` = 自動監視"
+            )
+            created.append(f"w{w['index']}: #{thread.name}")
+
+        save_map()
+        await message.reply("スレッド作成完了:\n" + "\n".join(created))
+        return
+
+    # !refresh : ウィンドウ一覧表示
+    if content in ("!windows", "!refresh"):
         try:
             wins = tmux_windows()
         except Exception as e:
@@ -180,64 +265,19 @@ async def on_message(message: discord.Message):
             return
         lines = []
         for w in wins:
-            mark = "▶" if w["index"] == active_window else " "
-            star = "★" if w["active"] else " "
-            lines.append(f"{mark}{star} [{w['index']}] {w['name']}  ({w['command']})")
-        await message.reply(f"```\n{chr(10).join(lines)}\n```\n▶=選択中  ★=tmuxアクティブ")
+            tid = next((t for t, i in thread_map.items() if i == w["index"]), None)
+            link = f"<#{tid}>" if tid else "（スレッドなし）"
+            lines.append(f"[{w['index']}] {w['name']} ({w['command']}) → {link}")
+        await message.reply("\n".join(lines))
         return
 
-    # ── !sw <n> : ウィンドウ切り替え ─────────────────────────
-    if content.startswith("!sw "):
-        try:
-            n = int(content[4:].strip())
-            active_window = n
-            wins = tmux_windows()
-            w = next((x for x in wins if x["index"] == n), None)
-            label = f"  ({w['command']})" if w else ""
-            await message.reply(f"ウィンドウ {n}{label} に切り替えました")
-        except ValueError:
-            await message.reply("使い方: `!sw <番号>`")
-        return
-
-    # ── !watch [n] : 自動監視開始 ─────────────────────────────
-    if content.startswith("!watch"):
-        if watch_task and not watch_task.done():
-            await message.reply("すでに監視中です。`!unwatch` で止められます。")
-            return
-        try:
-            n = int(content[6:].strip()) if content[6:].strip() else active_window
-        except ValueError:
-            n = active_window
-        watch_channel = message.channel
-        watch_task = asyncio.create_task(watch_loop(n))
-        await message.reply(f"ウィンドウ {n} の監視を開始しました。変化があると自動投稿します。`!unwatch` で停止。")
-        return
-
-    # ── !unwatch : 監視停止 ───────────────────────────────────
-    if content == "!unwatch":
-        if watch_task and not watch_task.done():
-            watch_task.cancel()
-            watch_task = None
-            await message.reply("監視を停止しました。")
-        else:
-            await message.reply("監視は動いていません。")
-        return
-
-    # ── !cap / !cap <n> ───────────────────────────────────────
-    if content.startswith("!cap"):
-        rest = content[4:].strip()
-        n = int(rest) if rest.isdigit() else active_window
-        out = truncate(tmux_capture(n))
-        await message.reply(f"```\n[w{n}]\n{out}\n```")
-        return
-
-    # ── !ai <テキスト> : Claude APIに質問 ────────────────────
+    # !ai
     if content.startswith("!ai "):
         if not ANTHROPIC_API_KEY:
-            await message.reply("ANTHROPIC_API_KEY が .env に設定されていません。")
+            await message.reply("ANTHROPIC_API_KEY が未設定です。")
             return
         prompt = content[4:].strip()
-        thinking = await message.reply("⏳ 考え中...")
+        thinking = await message.reply("⏳")
         try:
             import anthropic
             ac = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
@@ -247,7 +287,6 @@ async def on_message(message: discord.Message):
                 messages=[{"role": "user", "content": prompt}],
             )
             answer = resp.content[0].text
-            # 2000字制限対応
             for i in range(0, len(answer), 1900):
                 chunk = answer[i:i+1900]
                 if i == 0:
@@ -258,50 +297,22 @@ async def on_message(message: discord.Message):
             await thinking.edit(content=f"エラー: {e}")
         return
 
-    # ── !w<n> <cmd> : 指定ウィンドウで実行 ───────────────────
-    if content.startswith("!w") and len(content) > 2 and content[2].isdigit():
-        rest = content[2:]
-        space = rest.find(" ")
-        if space == -1:
-            n = int(rest)
-            out = truncate(tmux_capture(n))
-            await message.reply(f"```\n[w{n}]\n{out}\n```")
-            return
-        try:
-            n = int(rest[:space])
-            cmd = rest[space + 1:]
-        except ValueError:
-            return
-        try:
-            tmux_send(n, cmd)
-        except subprocess.CalledProcessError as e:
-            await message.reply(f"エラー: {e}")
-            return
-        await asyncio.sleep(0.8)
-        out = truncate(tmux_capture(n))
-        await message.reply(f"```\n[w{n}] $ {cmd}\n{out}\n```")
-        return
-
-    # ── !<cmd> : アクティブウィンドウで実行 ──────────────────
+    # メインチャンネルでの !<cmd>（後方互換）
     if content.startswith("!") and not content.startswith("!!"):
         cmd = content[1:].strip()
         if not cmd:
             return
-        try:
-            tmux_send(active_window, cmd)
-        except subprocess.CalledProcessError as e:
-            await message.reply(f"エラー: {e}")
-            return
-        await asyncio.sleep(0.8)
-        out = truncate(tmux_capture(active_window))
-        await message.reply(f"```\n[w{active_window}] $ {cmd}\n{out}\n```")
+        await message.reply(
+            "`!init` でウィンドウごとのスレッドを作ってください。\n"
+            "スレッド内でコマンドを入力するとtmuxに送られます。"
+        )
         return
 
 
 @client.event
 async def on_error(event, *args, **kwargs):
     import traceback
-    print(f"[error] event={event}", flush=True)
+    print(f"[error] {event}", flush=True)
     traceback.print_exc()
 
 
