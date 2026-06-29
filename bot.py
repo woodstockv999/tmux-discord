@@ -24,8 +24,8 @@ watch_tasks: dict[int, asyncio.Task] = {}
 ANSI_RE = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
 # Claude Code のツール呼び出し行にマッチ（⏺ 等のアイコン、もしくは "ToolName(" で始まる行）
 TOOL_RE = re.compile(r'[⏺✓✗⚡◆▶]|^\s*(?:Bash|Read|Edit|Write|Search|Glob|Task|Agent|WebFetch|WebSearch)\(')
-# シェルプロンプト行
-PROMPT_RE = re.compile(r'^\s*[>$#%❯]\s*$')
+# シェルプロンプト行（Claude Code の ❯ および bash の user@host:path$ 形式）
+PROMPT_RE = re.compile(r'^\s*[>$#%❯]\s*$|.+[#$]\s*$')
 # Claude Code が処理中であることを示すパターン
 CLAUDE_BUSY_RE = re.compile(r'Undulating|Working|Running|Thinking|\d+s\s*·|⎿\s*\$')
 
