@@ -113,7 +113,10 @@ async def on_ready():
 async def on_message(message: discord.Message):
     global active_window
 
+    print(f"[msg] author={message.author} bot={message.author.bot} channel={message.channel.id} content={repr(message.content)}", flush=True)
+
     if not is_allowed(message):
+        print(f"[msg] blocked", flush=True)
         return
 
     content = message.content.strip()
