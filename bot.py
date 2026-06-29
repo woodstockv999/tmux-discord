@@ -3,6 +3,7 @@ import subprocess
 import asyncio
 import os
 import json
+import re
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -16,11 +17,15 @@ intents = discord.Intents.default()
 intents.message_content = True
 client = discord.Client(intents=intents)
 
-# thread_id(str) → window_index(int)
 MAPPING_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "thread_map.json")
 thread_map: dict[str, int] = {}
+watch_tasks: dict[int, asyncio.Task] = {}
 
-watch_tasks: dict[int, asyncio.Task] = {}  # window_index → Task
+ANSI_RE = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
+# Claude Code のツール呼び出し行にマッチ（⏺ 等のアイコン、もしくは "ToolName(" で始まる行）
+TOOL_RE = re.compile(r'[⏺✓✗⚡◆▶]|^\s*(?:Bash|Read|Edit|Write|Search|Glob|Task|Agent|WebFetch|WebSearch)\(')
+# シェル/Claude Code プロンプト行
+PROMPT_RE = re.compile(r'^\s*[>$#%❯]\s*$')
 
 
 # ── 永続化 ────────────────────────────────────────────────────
@@ -42,17 +47,23 @@ def save_map():
 # ── tmux helpers ──────────────────────────────────────────────
 
 def tmux_send(window: int, text: str) -> None:
+    """テキストをtmuxペインに送信し、Enterを確実に押す"""
     subprocess.run(
-        ["tmux", "send-keys", "-t", f"{TMUX_SESSION}:{window}", "--", text, "Enter"],
+        ["tmux", "send-keys", "-t", f"{TMUX_SESSION}:{window}", "--", text],
+        check=True,
+    )
+    # Enterを別コマンドで送ることで送信を確実にする
+    subprocess.run(
+        ["tmux", "send-keys", "-t", f"{TMUX_SESSION}:{window}", "Enter"],
         check=True,
     )
 
 
-def tmux_capture(window: int) -> str:
-    result = subprocess.run(
-        ["tmux", "capture-pane", "-t", f"{TMUX_SESSION}:{window}", "-p"],
-        capture_output=True, text=True,
-    )
+def tmux_capture(window: int, scrollback: int = 0) -> str:
+    cmd = ["tmux", "capture-pane", "-t", f"{TMUX_SESSION}:{window}", "-p"]
+    if scrollback:
+        cmd += ["-S", f"-{scrollback}"]
+    result = subprocess.run(cmd, capture_output=True, text=True)
     return result.stdout
 
 
@@ -69,6 +80,12 @@ def tmux_windows() -> list[dict]:
     return windows
 
 
+# ── テキスト処理 ──────────────────────────────────────────────
+
+def strip_ansi(text: str) -> str:
+    return ANSI_RE.sub('', text)
+
+
 def truncate(text: str, limit: int = 1800) -> str:
     lines = text.splitlines()
     while lines and not lines[-1].strip():
@@ -79,20 +96,86 @@ def truncate(text: str, limit: int = 1800) -> str:
     return result
 
 
-async def wait_stable(window: int, timeout: int = 30) -> str:
-    """出力が2秒変化しなくなるまで待つ"""
+def ends_with_prompt(raw: str) -> bool:
+    """ANSIを除去後、末尾の非空行がプロンプト行か判定"""
+    lines = strip_ansi(raw).splitlines()
+    non_empty = [l for l in lines if l.strip()]
+    if not non_empty:
+        return False
+    last = non_empty[-1].strip()
+    return bool(PROMPT_RE.match(last))
+
+
+def extract_final_result(raw: str) -> str:
+    """
+    tmuxキャプチャからClaude Codeの最終応答テキストのみを抽出。
+    - ANSI除去
+    - 末尾プロンプト行を除去
+    - 下から走査し、ツール呼び出し行に当たったらそこで打ち切り
+    """
+    clean = strip_ansi(raw)
+    lines = clean.splitlines()
+
+    # 末尾のプロンプト行・空行を除去
+    while lines and (not lines[-1].strip() or PROMPT_RE.match(lines[-1].strip())):
+        lines.pop()
+
+    if not lines:
+        return ""
+
+    # 下から走査して最後の「ツール非呼び出し」ブロックを取得
+    result_lines: list[str] = []
+    for line in reversed(lines):
+        stripped = line.strip()
+        if TOOL_RE.search(stripped) or PROMPT_RE.match(stripped):
+            if result_lines:
+                break  # ツール行を超えた → ここまでが最終ブロック
+        else:
+            result_lines.insert(0, line)
+
+    # 先頭の空行を除去
+    while result_lines and not result_lines[0].strip():
+        result_lines.pop(0)
+
+    result = "\n".join(result_lines).strip()
+
+    # 抽出できなければ全体をフォールバック
+    if not result:
+        fallback = "\n".join(lines).strip()
+        return truncate(fallback)
+
+    if len(result) > 1800:
+        result = "...(省略)...\n" + result[-1800:]
+    return result
+
+
+# ── 完了待機 ──────────────────────────────────────────────────
+
+async def wait_for_completion(window: int, timeout: int = 300) -> str:
+    """
+    tmuxペインの出力が安定 かつ プロンプト行で終わるまで待機。
+    timeout秒経過したら最後のキャプチャを返す。
+    """
+    # コマンドが処理開始するまで少し待つ
+    await asyncio.sleep(1.0)
+
     prev = ""
     stable = 0
-    for _ in range(timeout * 2):
+
+    for _ in range(timeout * 2):  # 0.5秒ごとにポーリング
         await asyncio.sleep(0.5)
-        cur = tmux_capture(window)
+        cur = tmux_capture(window, scrollback=100)
+
         if cur == prev:
             stable += 1
-            if stable >= 4:
-                break
         else:
             stable = 0
             prev = cur
+
+        # 3秒間変化なし + プロンプト行で終わっていれば完了
+        if stable >= 6 and ends_with_prompt(cur):
+            return cur
+
     return prev
 
 
@@ -105,7 +188,7 @@ async def watch_loop(window: int, thread: discord.Thread):
         cur = tmux_capture(window)
         if cur != last:
             try:
-                await thread.send(f"```\n{truncate(cur)}\n```")
+                await thread.send(f"```\n{truncate(strip_ansi(cur))}\n```")
             except Exception:
                 pass
             last = cur
@@ -135,6 +218,8 @@ def save_env(key: str, value: str) -> None:
         f.writelines(lines)
 
 
+# ── helpers ───────────────────────────────────────────────────
+
 def is_main_channel(message: discord.Message) -> bool:
     if message.author.bot:
         return False
@@ -144,7 +229,6 @@ def is_main_channel(message: discord.Message) -> bool:
 
 
 def get_thread_window(message: discord.Message) -> int | None:
-    """メッセージがスレッド内なら対応ウィンドウ番号を返す"""
     if not isinstance(message.channel, discord.Thread):
         return None
     return thread_map.get(str(message.channel.id))
@@ -173,22 +257,22 @@ async def on_message(message: discord.Message):
         content = message.content.strip()
 
         if content == "!enter":
-            subprocess.run(["tmux", "send-keys", "-t", f"{TMUX_SESSION}:{window}", "--", "Enter"])
+            subprocess.run(["tmux", "send-keys", "-t", f"{TMUX_SESSION}:{window}", "Enter"])
             await asyncio.sleep(0.5)
-            out = truncate(tmux_capture(window))
+            out = truncate(strip_ansi(tmux_capture(window)))
             await message.reply(f"```\n{out}\n```")
             return
 
         if content.startswith("!key "):
             key = content[5:].strip()
-            subprocess.run(["tmux", "send-keys", "-t", f"{TMUX_SESSION}:{window}", "--", key])
+            subprocess.run(["tmux", "send-keys", "-t", f"{TMUX_SESSION}:{window}", key])
             await asyncio.sleep(0.5)
-            out = truncate(tmux_capture(window))
+            out = truncate(strip_ansi(tmux_capture(window)))
             await message.reply(f"```\n{out}\n```")
             return
 
         if content == "!cap":
-            out = truncate(tmux_capture(window))
+            out = truncate(strip_ansi(tmux_capture(window, scrollback=50)))
             await message.reply(f"```\n{out}\n```")
             return
 
@@ -212,17 +296,27 @@ async def on_message(message: discord.Message):
             return
 
         if content.startswith("!"):
-            return  # 未知のコマンドは無視
+            return
 
-        # 通常テキスト → tmuxウィンドウへ送信
+        # ── 通常テキスト: tmuxへ送信 ──────────────────────────
         try:
             tmux_send(window, content)
         except subprocess.CalledProcessError as e:
-            await message.reply(f"エラー: {e}")
+            await message.reply(f"tmux送信エラー: {e}")
             return
-        await message.reply("⏳")
-        out = await wait_stable(window)
-        await message.reply(f"```\n{truncate(out)}\n```")
+
+        # tmuxが受信確認できたら ⌛️ を新規送信
+        await message.channel.send("⌛️")
+
+        # 処理完了まで待機
+        raw = await wait_for_completion(window)
+
+        # 最終結果のみ抽出して返信
+        result = extract_final_result(raw)
+        if result:
+            await message.reply(f"```\n{result}\n```")
+        else:
+            await message.reply("（出力なし）")
         return
 
     # ── メインチャンネル内メッセージ ─────────────────────────
@@ -231,14 +325,12 @@ async def on_message(message: discord.Message):
 
     content = message.content.strip()
 
-    # !setchannel
     if content == "!setchannel":
         ALLOWED_CHANNEL = str(message.channel.id)
         save_env("DISCORD_CHANNEL_ID", ALLOWED_CHANNEL)
-        await message.reply(f"このチャンネルに固定しました。")
+        await message.reply("このチャンネルに固定しました。")
         return
 
-    # !init : tmuxウィンドウごとにスレッドを作成
     if content == "!init":
         try:
             wins = tmux_windows()
@@ -249,7 +341,6 @@ async def on_message(message: discord.Message):
         created = []
         for w in wins:
             name = f"w{w['index']} • {w['name']} [{w['command']}]"
-            # 既存スレッドがあればスキップ
             existing = next(
                 (tid for tid, idx in thread_map.items() if idx == w["index"]), None
             )
@@ -273,7 +364,6 @@ async def on_message(message: discord.Message):
         await message.reply("スレッド作成完了:\n" + "\n".join(created))
         return
 
-    # !refresh : ウィンドウ一覧表示
     if content in ("!windows", "!refresh"):
         try:
             wins = tmux_windows()
@@ -288,7 +378,6 @@ async def on_message(message: discord.Message):
         await message.reply("\n".join(lines))
         return
 
-    # !ai
     if content.startswith("!ai "):
         if not ANTHROPIC_API_KEY:
             await message.reply("ANTHROPIC_API_KEY が未設定です。")
@@ -304,21 +393,14 @@ async def on_message(message: discord.Message):
                 messages=[{"role": "user", "content": prompt}],
             )
             answer = resp.content[0].text
-            for i in range(0, len(answer), 1900):
-                chunk = answer[i:i+1900]
-                if i == 0:
-                    await thinking.edit(content=chunk)
-                else:
-                    await message.channel.send(chunk)
+            await thinking.edit(content=answer[:1900])
+            for i in range(1900, len(answer), 1900):
+                await message.channel.send(answer[i:i + 1900])
         except Exception as e:
             await thinking.edit(content=f"エラー: {e}")
         return
 
-    # メインチャンネルでの !<cmd>（後方互換）
     if content.startswith("!") and not content.startswith("!!"):
-        cmd = content[1:].strip()
-        if not cmd:
-            return
         await message.reply(
             "`!init` でウィンドウごとのスレッドを作ってください。\n"
             "スレッド内でコマンドを入力するとtmuxに送られます。"
