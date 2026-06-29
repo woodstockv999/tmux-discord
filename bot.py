@@ -24,8 +24,10 @@ watch_tasks: dict[int, asyncio.Task] = {}
 ANSI_RE = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
 # Claude Code のツール呼び出し行にマッチ（⏺ 等のアイコン、もしくは "ToolName(" で始まる行）
 TOOL_RE = re.compile(r'[⏺✓✗⚡◆▶]|^\s*(?:Bash|Read|Edit|Write|Search|Glob|Task|Agent|WebFetch|WebSearch)\(')
-# シェル/Claude Code プロンプト行
+# シェルプロンプト行
 PROMPT_RE = re.compile(r'^\s*[>$#%❯]\s*$')
+# Claude Code が処理中であることを示すパターン
+CLAUDE_BUSY_RE = re.compile(r'Undulating|Working|Running|Thinking|\d+s\s*·|⎿\s*\$')
 
 
 # ── 永続化 ────────────────────────────────────────────────────
@@ -96,14 +98,16 @@ def truncate(text: str, limit: int = 1800) -> str:
     return result
 
 
-def ends_with_prompt(raw: str) -> bool:
-    """ANSIを除去後、末尾の非空行がプロンプト行か判定"""
-    lines = strip_ansi(raw).splitlines()
-    non_empty = [l for l in lines if l.strip()]
-    if not non_empty:
+def is_idle(raw: str) -> bool:
+    """
+    Claude Code / シェルがアイドル状態か判定。
+    - ANSI除去後に処理中サイン（Undulating等）がなく
+    - かつ ❯ または $ プロンプトが含まれていれば idle とみなす
+    """
+    clean = strip_ansi(raw)
+    if CLAUDE_BUSY_RE.search(clean):
         return False
-    last = non_empty[-1].strip()
-    return bool(PROMPT_RE.match(last))
+    return bool(re.search(r'^\s*[❯>$#%]\s*$', clean, re.MULTILINE))
 
 
 def extract_final_result(raw: str) -> str:
@@ -173,7 +177,7 @@ async def wait_for_completion(window: int, timeout: int = 300) -> str:
             prev = cur
 
         # 3秒間変化なし + プロンプト行で終わっていれば完了
-        if stable >= 6 and ends_with_prompt(cur):
+        if stable >= 6 and is_idle(cur):
             return cur
 
     return prev
