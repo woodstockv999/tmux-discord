@@ -43,7 +43,7 @@ STARTUP_RE = re.compile(r'Resume this session with:|Claude Code v\d|claude --dan
 async def safe_reply(message: discord.Message, content: str) -> discord.Message:
     """system message への reply は Discord が拒否するので channel.send にフォールバック"""
     try:
-        return await safe_reply(message,content)
+        return await message.reply(content)
     except discord.HTTPException as e:
         if e.code == 50035:
             return await message.channel.send(content)
