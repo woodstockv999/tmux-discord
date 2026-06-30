@@ -161,29 +161,36 @@ def extract_final_result(raw: str) -> str:
         if result:
             return truncate(result)
 
-    # Bash フォールバック: UI除去後に末尾ブロックを逆走査
-    lines = [l for l in lines if not CHROME_RE.search(l) and not PROMPT_RE.match(l.strip())]
-    while lines and not lines[-1].strip():
-        lines.pop()
-    if not lines:
-        return ""
+    # ● がスクロールアウトしている場合: 末尾から ✻/❯ で区切られた
+    # 直近の応答テキストブロックを逆走査で取得
+    filtered = []
+    for line in lines:
+        s = line.strip()
+        if CHROME_RE.search(line) or PROMPT_RE.match(s):
+            continue
+        if s.startswith(('✻', '⏺', '❯', '⎿', '●')):
+            filtered.append(None)  # ブロック区切りマーカー
+        else:
+            filtered.append(line)
 
-    result_lines = []
-    for line in reversed(lines):
-        stripped = line.strip()
-        if TOOL_RE.search(stripped) or PROMPT_RE.match(stripped):
-            if result_lines:
+    # 末尾の空行・マーカーを除去
+    while filtered and (filtered[-1] is None or not (filtered[-1] or '').strip()):
+        filtered.pop()
+
+    # マーカーで分割し最後のブロックを取得
+    last_block: list[str] = []
+    for item in reversed(filtered):
+        if item is None:
+            if last_block:
                 break
         else:
-            result_lines.insert(0, line)
+            last_block.insert(0, item)
 
-    while result_lines and not result_lines[0].strip():
-        result_lines.pop(0)
+    while last_block and not last_block[0].strip():
+        last_block.pop(0)
 
-    result = "\n".join(result_lines).strip()
-    if not result:
-        return truncate('\n'.join(lines))
-    return truncate(result)
+    result = "\n".join(last_block).strip()
+    return truncate(result) if result else ""
 
 
 # ── 完了待機 ──────────────────────────────────────────────────
@@ -228,7 +235,9 @@ async def _window_worker(window: int) -> None:
             await message.reply(f"tmux送信エラー: {e}")
             continue
 
-        raw = await wait_for_completion(window)
+        await wait_for_completion(window)
+        # 安定確認後に大きめのスクロールバックで全量を取得
+        raw = await tmux_capture(window, scrollback=1000)
         result = extract_final_result(raw)
         if result:
             await message.reply(f"```\n{result}\n```")
