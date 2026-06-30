@@ -40,6 +40,16 @@ FEEDBACK_RE = re.compile(r'How is Claude doing this session|\d+:\s*(?:Bad|Fine|G
 STARTUP_RE = re.compile(r'Resume this session with:|Claude Code v\d|claude --dangerously')
 
 
+async def safe_reply(message: discord.Message, content: str) -> discord.Message:
+    """system message への reply は Discord が拒否するので channel.send にフォールバック"""
+    try:
+        return await safe_reply(message,content)
+    except discord.HTTPException as e:
+        if e.code == 50035:
+            return await message.channel.send(content)
+        raise
+
+
 # ── 永続化 ────────────────────────────────────────────────────
 
 def load_map():
@@ -448,7 +458,7 @@ async def _window_worker(window: int) -> None:
         except subprocess.CalledProcessError as e:
             print(f"[worker] win={window} send_error: {e}", flush=True)
             try:
-                await message.reply(f"tmux送信エラー: {e}")
+                await safe_reply(message,f"tmux送信エラー: {e}")
             except Exception:
                 pass
             continue
@@ -513,16 +523,16 @@ async def _window_worker(window: int) -> None:
             if result:
                 chunks = split_chunks(result)
                 print(f"[worker] win={window} sending {len(chunks)} chunk(s)", flush=True)
-                await message.reply(f"```\n{chunks[0]}\n```")
+                await safe_reply(message,f"```\n{chunks[0]}\n```")
                 for chunk in chunks[1:]:
                     await message.channel.send(f"```\n{chunk}\n```")
             else:
-                await message.reply("（出力なし）")
+                await safe_reply(message,"（出力なし）")
         except Exception as e:
             print(f"[worker] win={window} exception: {e}", flush=True)
             import traceback; traceback.print_exc()
             try:
-                await message.reply(f"エラー: {e}")
+                await safe_reply(message,f"エラー: {e}")
             except Exception:
                 pass
 
@@ -608,7 +618,7 @@ async def on_message(message: discord.Message):
             await asyncio.to_thread(subprocess.run, ["tmux", "send-keys", "-t", f"{TMUX_SESSION}:{window}", "Enter"])
             await asyncio.sleep(2.5)
             out = truncate(strip_ansi(await tmux_capture(window, scrollback=50)))
-            await message.reply(f"```\n{out}\n```")
+            await safe_reply(message,f"```\n{out}\n```")
             return
 
         if content.startswith("!key "):
@@ -616,31 +626,31 @@ async def on_message(message: discord.Message):
             await asyncio.to_thread(subprocess.run, ["tmux", "send-keys", "-t", f"{TMUX_SESSION}:{window}", key])
             await asyncio.sleep(0.5)
             out = truncate(strip_ansi(await tmux_capture(window)))
-            await message.reply(f"```\n{out}\n```")
+            await safe_reply(message,f"```\n{out}\n```")
             return
 
         if content == "!cap":
             out = truncate(strip_ansi(await tmux_capture(window, scrollback=50)))
-            await message.reply(f"```\n{out}\n```")
+            await safe_reply(message,f"```\n{out}\n```")
             return
 
         if content == "!watch":
             if window in watch_tasks and not watch_tasks[window].done():
-                await message.reply("すでに監視中です。`!unwatch` で停止。")
+                await safe_reply(message,"すでに監視中です。`!unwatch` で停止。")
                 return
             watch_tasks[window] = asyncio.create_task(
                 watch_loop(window, message.channel)
             )
-            await message.reply(f"ウィンドウ {window} の監視を開始しました。")
+            await safe_reply(message,f"ウィンドウ {window} の監視を開始しました。")
             return
 
         if content == "!unwatch":
             t = watch_tasks.pop(window, None)
             if t:
                 t.cancel()
-                await message.reply("監視停止しました。")
+                await safe_reply(message,"監視停止しました。")
             else:
-                await message.reply("監視は動いていません。")
+                await safe_reply(message,"監視は動いていません。")
             return
 
         if content.startswith("!"):
@@ -665,14 +675,14 @@ async def on_message(message: discord.Message):
     if content == "!setchannel":
         ALLOWED_CHANNEL = str(message.channel.id)
         save_env("DISCORD_CHANNEL_ID", ALLOWED_CHANNEL)
-        await message.reply("このチャンネルに固定しました。")
+        await safe_reply(message,"このチャンネルに固定しました。")
         return
 
     if content == "!init":
         try:
             wins = tmux_windows()
         except Exception as e:
-            await message.reply(f"tmuxエラー: {e}")
+            await safe_reply(message,f"tmuxエラー: {e}")
             return
 
         created = []
@@ -698,29 +708,29 @@ async def on_message(message: discord.Message):
             created.append(f"w{w['index']}: #{thread.name}")
 
         save_map()
-        await message.reply("スレッド作成完了:\n" + "\n".join(created))
+        await safe_reply(message,"スレッド作成完了:\n" + "\n".join(created))
         return
 
     if content in ("!windows", "!refresh"):
         try:
             wins = tmux_windows()
         except Exception as e:
-            await message.reply(f"エラー: {e}")
+            await safe_reply(message,f"エラー: {e}")
             return
         lines = []
         for w in wins:
             tid = next((t for t, i in thread_map.items() if i == w["index"]), None)
             link = f"<#{tid}>" if tid else "（スレッドなし）"
             lines.append(f"[{w['index']}] {w['name']} ({w['command']}) → {link}")
-        await message.reply("\n".join(lines))
+        await safe_reply(message,"\n".join(lines))
         return
 
     if content.startswith("!ai "):
         if not ANTHROPIC_API_KEY:
-            await message.reply("ANTHROPIC_API_KEY が未設定です。")
+            await safe_reply(message,"ANTHROPIC_API_KEY が未設定です。")
             return
         prompt = content[4:].strip()
-        thinking = await message.reply("⏳")
+        thinking = await safe_reply(message,"⏳")
         try:
             import anthropic
             ac = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
@@ -738,7 +748,7 @@ async def on_message(message: discord.Message):
         return
 
     if content.startswith("!") and not content.startswith("!!"):
-        await message.reply(
+        await safe_reply(message,
             "`!init` でウィンドウごとのスレッドを作ってください。\n"
             "スレッド内でコマンドを入力するとtmuxに送られます。"
         )
