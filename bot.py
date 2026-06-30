@@ -4,6 +4,7 @@ import asyncio
 import os
 import json
 import re
+import glob
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -222,6 +223,56 @@ def extract_final_result(raw: str) -> str:
     return result if result else ""
 
 
+# ── Claude JSONL 読み取り ──────────────────────────────────────
+
+def _get_pane_cwd_sync(window: int) -> str:
+    result = subprocess.run(
+        ["tmux", "display-message", "-t", f"{TMUX_SESSION}:{window}", "-p", "#{pane_current_path}"],
+        capture_output=True, text=True,
+    )
+    return result.stdout.strip()
+
+
+def _jsonl_dir_for_cwd(cwd: str) -> str:
+    project = cwd.replace('/', '-')  # /home/w00dst0ck → -home-w00dst0ck
+    return os.path.expanduser(f"~/.claude/projects/{project}")
+
+
+def _latest_jsonl_state(directory: str) -> tuple[str, int] | None:
+    """最近変更された JSONL ファイルのパスと現在サイズを返す。"""
+    try:
+        files = glob.glob(os.path.join(directory, "*.jsonl"))
+        if not files:
+            return None
+        path = max(files, key=os.path.getmtime)
+        return (path, os.path.getsize(path))
+    except Exception:
+        return None
+
+
+def _read_assistant_text_since(jsonl_path: str, offset: int) -> str:
+    """JSONL の offset 以降から最後の assistant テキストブロックを返す。"""
+    try:
+        with open(jsonl_path, 'rb') as f:
+            f.seek(offset)
+            new_content = f.read().decode('utf-8', errors='replace')
+        last_text = ""
+        for line in new_content.splitlines():
+            try:
+                obj = json.loads(line)
+                if obj.get('type') == 'assistant':
+                    for block in obj.get('message', {}).get('content', []):
+                        if isinstance(block, dict) and block.get('type') == 'text':
+                            text = block.get('text', '').strip()
+                            if text and not FEEDBACK_RE.search(text):
+                                last_text = text
+            except Exception:
+                pass
+        return last_text
+    except Exception:
+        return ""
+
+
 # ── 完了待機 ──────────────────────────────────────────────────
 
 async def wait_for_completion(window: int, timeout: int = 300) -> str:
@@ -270,11 +321,35 @@ async def _window_worker(window: int) -> None:
             continue
 
         try:
+            # 送信前に JSONL ファイルの状態を記録
+            cwd = await asyncio.to_thread(_get_pane_cwd_sync, window)
+            jsonl_dir = _jsonl_dir_for_cwd(cwd)
+            jsonl_state = await asyncio.to_thread(_latest_jsonl_state, jsonl_dir)
+            print(f"[worker] win={window} jsonl_dir={jsonl_dir} state={jsonl_state}", flush=True)
+
             await wait_for_completion(window)
-            raw = await tmux_capture(window, scrollback=1000)
-            print(f"[worker] win={window} captured {len(raw)} chars", flush=True)
-            result = extract_final_result(raw)
-            print(f"[worker] win={window} result {len(result)} chars: {repr(result[:60])}", flush=True)
+
+            # まず JSONL から応答を取得（capture-pane より確実）
+            result = ""
+            if jsonl_state:
+                jsonl_path, offset = jsonl_state
+                # セッションが変わった場合は最新の JSONL を探す
+                new_state = await asyncio.to_thread(_latest_jsonl_state, jsonl_dir)
+                if new_state:
+                    new_path, new_size = new_state
+                    read_path = new_path
+                    read_offset = offset if new_path == jsonl_path else 0
+                    if new_size > read_offset:
+                        result = await asyncio.to_thread(_read_assistant_text_since, read_path, read_offset)
+                        print(f"[worker] win={window} jsonl result {len(result)} chars", flush=True)
+
+            # JSONL で取れなければ capture-pane フォールバック
+            if not result:
+                raw = await tmux_capture(window, scrollback=1000)
+                print(f"[worker] win={window} captured {len(raw)} chars (fallback)", flush=True)
+                result = extract_final_result(raw)
+                print(f"[worker] win={window} fallback result {len(result)} chars: {repr(result[:60])}", flush=True)
+
             if result:
                 chunks = split_chunks(result)
                 print(f"[worker] win={window} sending {len(chunks)} chunk(s)", flush=True)
