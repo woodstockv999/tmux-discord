@@ -36,6 +36,8 @@ CLAUDE_BUSY_RE = re.compile(r'Undulating|Working|Running|Thinking|\d+s\s*·|⎿\
 CHROME_RE = re.compile(r'^[─━═╌╍┈┉\s]+$|⏵⏵|⏺⏺')
 # Claude Code セッション評価フィードバックプロンプト
 FEEDBACK_RE = re.compile(r'How is Claude doing this session|\d+:\s*(?:Bad|Fine|Good|Dismiss)')
+# Claude Code / bash の起動・初期化テキスト（pane fallback で送信しない）
+STARTUP_RE = re.compile(r'Resume this session with:|Claude Code v\d|claude --dangerously')
 
 
 # ── 永続化 ────────────────────────────────────────────────────
@@ -440,7 +442,12 @@ async def _window_worker(window: int) -> None:
                 raw = await tmux_capture(window, scrollback=1000)
                 print(f"[worker] win={window} pane fallback {len(raw)} chars", flush=True)
                 result = extract_final_result(raw)
-                print(f"[worker] win={window} pane result {len(result)} chars: {repr(result[:60])}", flush=True)
+                # 起動テキスト・bash プロンプトのみなら送信しない
+                if result and STARTUP_RE.search(result):
+                    print(f"[worker] win={window} pane result skipped (startup text)", flush=True)
+                    result = ""
+                else:
+                    print(f"[worker] win={window} pane result {len(result)} chars: {repr(result[:60])}", flush=True)
 
             if result:
                 chunks = split_chunks(result)
