@@ -178,7 +178,7 @@ def extract_final_result(raw: str) -> str:
             result_lines.pop()
         result = '\n'.join(result_lines).strip()
         if result:
-            return truncate(result)
+            return result  # 呼び出し側で split_chunks するので truncate しない
 
     # ● がスクロールアウトしている場合: 末尾から ✻/❯ で区切られた
     # 直近の応答テキストブロックを逆走査で取得
@@ -209,7 +209,7 @@ def extract_final_result(raw: str) -> str:
         last_block.pop(0)
 
     result = "\n".join(last_block).strip()
-    return truncate(result) if result else ""
+    return result if result else ""
 
 
 # ── 完了待機 ──────────────────────────────────────────────────
