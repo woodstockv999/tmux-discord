@@ -111,6 +111,25 @@ def truncate(text: str, limit: int = 1800) -> str:
     return result
 
 
+def split_chunks(text: str, chunk_size: int = 1800) -> list[str]:
+    """テキストを行単位で chunk_size 以下のチャンクに分割する"""
+    lines = text.splitlines()
+    chunks: list[str] = []
+    current: list[str] = []
+    current_len = 0
+    for line in lines:
+        line_len = len(line) + 1
+        if current_len + line_len > chunk_size and current:
+            chunks.append("\n".join(current))
+            current = []
+            current_len = 0
+        current.append(line)
+        current_len += line_len
+    if current:
+        chunks.append("\n".join(current))
+    return chunks or [""]
+
+
 def is_idle(raw: str) -> bool:
     """
     Claude Code / シェルがアイドル状態か判定。
@@ -240,7 +259,10 @@ async def _window_worker(window: int) -> None:
         raw = await tmux_capture(window, scrollback=1000)
         result = extract_final_result(raw)
         if result:
-            await message.reply(f"```\n{result}\n```")
+            chunks = split_chunks(result)
+            await message.reply(f"```\n{chunks[0]}\n```")
+            for chunk in chunks[1:]:
+                await message.channel.send(f"```\n{chunk}\n```")
         else:
             await message.reply("（出力なし）")
 
