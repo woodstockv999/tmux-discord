@@ -4,6 +4,7 @@ import asyncio
 import os
 import json
 import re
+import time
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -237,17 +238,85 @@ def _jsonl_dir_for_cwd(cwd: str) -> str:
     return os.path.expanduser(f"~/.claude/projects/{project}")
 
 
-def _latest_jsonl_state(directory: str) -> tuple[str, int] | None:
-    """最近変更された JSONL ファイルのパスと現在サイズを返す。"""
+def _scan_jsonl_dir_sync(directory: str) -> dict[str, int]:
+    """JSONL ディレクトリ内の全ファイルとそのサイズを返す（送信前スナップショット用）。"""
     try:
         import glob as _glob
         files = _glob.glob(os.path.join(directory, "*.jsonl"))
-        if not files:
-            return None
-        path = max(files, key=os.path.getmtime)
-        return (path, os.path.getsize(path))
+        return {path: os.path.getsize(path) for path in files}
     except Exception:
-        return None
+        return {}
+
+
+def _find_session_jsonl_sync(
+    directory: str,
+    user_text: str,
+    known_sizes: dict[str, int],
+    send_time: float,
+    timeout: float = 8.0,
+) -> tuple[str, int] | None:
+    """
+    メッセージ送信後、どのJSONLファイルがそのメッセージを受け取ったかを特定する。
+    user entry のタイムスタンプ（≥ send_time - 5s）とテキスト内容でマッチング。
+    戻り値: (path, pre_send_offset) — 送信前のファイルサイズをオフセットとして返す。
+    全ウィンドウが同じ ~/.claude/projects/<cwd>/ を共有する問題の根本修正。
+    """
+    import glob as _glob
+    from datetime import datetime, timezone
+
+    deadline = time.monotonic() + timeout
+    match_text = user_text.strip()[:80]  # 最初の80文字でマッチング
+
+    while time.monotonic() < deadline:
+        files = _glob.glob(os.path.join(directory, "*.jsonl"))
+        for path in files:
+            try:
+                known = known_sizes.get(path, 0)
+                current_size = os.path.getsize(path)
+                if current_size <= known:
+                    continue
+                with open(path, 'rb') as f:
+                    f.seek(known)
+                    new_content = f.read().decode('utf-8', errors='replace')
+                for line in new_content.splitlines():
+                    try:
+                        obj = json.loads(line)
+                        if obj.get('type') != 'user':
+                            continue
+                        # タイムスタンプフィルタ: 送信5秒前以降のエントリのみ
+                        ts_str = obj.get('timestamp', '')
+                        if ts_str:
+                            try:
+                                ts = datetime.fromisoformat(
+                                    ts_str.replace('Z', '+00:00')
+                                ).timestamp()
+                                if ts < send_time - 5.0:
+                                    continue
+                            except Exception:
+                                pass
+                        # テキスト内容マッチング
+                        content_list = obj.get('message', {}).get('content', []) or []
+                        matched = False
+                        items = [content_list] if isinstance(content_list, str) else content_list
+                        for block in items:
+                            entry_text = (
+                                block if isinstance(block, str)
+                                else (block.get('text', '') if isinstance(block, dict) and block.get('type') == 'text' else '')
+                            ).strip()
+                            if not entry_text:
+                                continue
+                            if (match_text and match_text in entry_text) or (entry_text and entry_text in user_text):
+                                matched = True
+                                break
+                        if matched:
+                            print(f"[jsonl] bound {os.path.basename(path)} for text={repr(match_text[:30])}", flush=True)
+                            return (path, known)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+        time.sleep(0.2)
+    return None
 
 
 def _read_assistant_text_since(jsonl_path: str, offset: int) -> str:
@@ -311,19 +380,19 @@ async def _window_worker(window: int) -> None:
         message, content = await q.get()
         print(f"[worker] win={window} dequeue: {repr(content[:40])}", flush=True)
 
-        # tmux_send より前に JSONL ファイルとオフセットを確定させる
-        # → ポーリング中に他ウィンドウの書き込みで「最近更新ファイル」が変わっても影響なし
-        jsonl_path_pre = None
+        # 送信前: ディレクトリ内の全 JSONL ファイルとサイズをスナップショット
+        jsonl_path = None
         jsonl_offset = 0
+        jsonl_dir = None
+        known_sizes: dict[str, int] = {}
         try:
             cwd = await asyncio.to_thread(_get_pane_cwd_sync, window)
             jsonl_dir = _jsonl_dir_for_cwd(cwd)
-            state = await asyncio.to_thread(_latest_jsonl_state, jsonl_dir)
-            if state:
-                jsonl_path_pre, jsonl_offset = state
+            known_sizes = await asyncio.to_thread(_scan_jsonl_dir_sync, jsonl_dir)
         except Exception as e:
-            print(f"[worker] win={window} jsonl_pre_err: {e}", flush=True)
+            print(f"[worker] win={window} pre_err: {e}", flush=True)
 
+        send_time = time.time()
         try:
             await tmux_send(window, content)
         except subprocess.CalledProcessError as e:
@@ -335,20 +404,28 @@ async def _window_worker(window: int) -> None:
             continue
 
         try:
-            await wait_for_completion(window)
-
             result = ""
 
-            if jsonl_path_pre:
-                # JSONL ポーリング: wait_for_completion 後も最大30秒待機
-                # （Claude Code の JSONL 書き込みが ❯ 表示より遅れる場合に対応）
-                for _ in range(60):
+            if jsonl_dir:
+                # 送信後: user entry のタイムスタンプ+テキストマッチでセッションファイルを特定
+                # これにより全ウィンドウが同じ JSONL ディレクトリを共有していても混線しない
+                session = await asyncio.to_thread(
+                    _find_session_jsonl_sync, jsonl_dir, content, known_sizes, send_time
+                )
+                if session:
+                    jsonl_path, jsonl_offset = session
+                else:
+                    print(f"[worker] win={window} jsonl_bind_failed: falling back to capture-pane", flush=True)
+
+            if jsonl_path:
+                # JSONL ポーリング（最大120秒）— wait_for_completion は不要
+                for _ in range(240):
                     await asyncio.sleep(0.5)
                     try:
-                        new_size = await asyncio.to_thread(os.path.getsize, jsonl_path_pre)
+                        new_size = await asyncio.to_thread(os.path.getsize, jsonl_path)
                         if new_size > jsonl_offset:
                             text = await asyncio.to_thread(
-                                _read_assistant_text_since, jsonl_path_pre, jsonl_offset
+                                _read_assistant_text_since, jsonl_path, jsonl_offset
                             )
                             if text:
                                 result = text
@@ -357,8 +434,9 @@ async def _window_worker(window: int) -> None:
                         pass
                 print(f"[worker] win={window} jsonl result {len(result)} chars", flush=True)
 
-            # JSONL が使えない or 空 → capture-pane フォールバック（非 Claude Code ウィンドウ用）
+            # JSONL が使えない or 空 → capture-pane フォールバック
             if not result:
+                await wait_for_completion(window)
                 raw = await tmux_capture(window, scrollback=1000)
                 print(f"[worker] win={window} pane fallback {len(raw)} chars", flush=True)
                 result = extract_final_result(raw)
