@@ -20,6 +20,9 @@ client = discord.Client(intents=intents)
 MAPPING_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "thread_map.json")
 thread_map: dict[str, int] = {}
 watch_tasks: dict[int, asyncio.Task] = {}
+# ウィンドウごとのメッセージキュー（同一ウィンドウは順番に処理）
+window_queues: dict[int, asyncio.Queue] = {}
+window_workers: dict[int, asyncio.Task] = {}
 
 ANSI_RE = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
 # Claude Code のツール呼び出し行にマッチ（⏺ 等のアイコン、もしくは "ToolName(" で始まる行）
@@ -213,6 +216,26 @@ async def wait_for_completion(window: int, timeout: int = 300) -> str:
     return prev
 
 
+# ── window worker（1ウィンドウ1件ずつ順番に処理）─────────────
+
+async def _window_worker(window: int) -> None:
+    q = window_queues[window]
+    while not q.empty():
+        message, content = await q.get()
+        try:
+            await tmux_send(window, content)
+        except subprocess.CalledProcessError as e:
+            await message.reply(f"tmux送信エラー: {e}")
+            continue
+
+        raw = await wait_for_completion(window)
+        result = extract_final_result(raw)
+        if result:
+            await message.reply(f"```\n{result}\n```")
+        else:
+            await message.reply("（出力なし）")
+
+
 # ── watch loop ────────────────────────────────────────────────
 
 async def watch_loop(window: int, thread: discord.Thread):
@@ -332,25 +355,14 @@ async def on_message(message: discord.Message):
         if content.startswith("!"):
             return
 
-        # ── 通常テキスト: tmuxへ送信 ──────────────────────────
-        try:
-            await tmux_send(window, content)
-        except subprocess.CalledProcessError as e:
-            await message.reply(f"tmux送信エラー: {e}")
-            return
-
-        # tmuxが受信確認できたら ⌛️ を新規送信
+        # ── 通常テキスト: キューに追加して順番に処理 ──────────
         await message.channel.send("⌛️")
+        q = window_queues.setdefault(window, asyncio.Queue())
+        await q.put((message, content))
 
-        # 処理完了まで待機
-        raw = await wait_for_completion(window)
-
-        # 最終結果のみ抽出して返信
-        result = extract_final_result(raw)
-        if result:
-            await message.reply(f"```\n{result}\n```")
-        else:
-            await message.reply("（出力なし）")
+        # ワーカーがなければ起動
+        if window not in window_workers or window_workers[window].done():
+            window_workers[window] = asyncio.create_task(_window_worker(window))
         return
 
     # ── メインチャンネル内メッセージ ─────────────────────────
