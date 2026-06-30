@@ -408,37 +408,35 @@ async def _window_worker(window: int) -> None:
         try:
             result = ""
 
-            if jsonl_dir:
-                # 送信後: user entry のタイムスタンプ+テキストマッチでセッションファイルを特定
-                # これにより全ウィンドウが同じ JSONL ディレクトリを共有していても混線しない
+            # JSONL バインドと wait_for_completion を並列実行
+            # → バインドは通常1〜2秒で完了、完了待ちはその後も継続
+            async def _bind_session():
+                if not jsonl_dir:
+                    return None
                 session = await asyncio.to_thread(
                     _find_session_jsonl_sync, jsonl_dir, content, known_sizes, send_time
                 )
-                if session:
-                    jsonl_path, jsonl_offset = session
-                else:
-                    print(f"[worker] win={window} jsonl_bind_failed: falling back to capture-pane", flush=True)
+                return session
 
+            bind_result, _ = await asyncio.gather(
+                _bind_session(), wait_for_completion(window)
+            )
+            if bind_result:
+                jsonl_path, jsonl_offset = bind_result
+            else:
+                print(f"[worker] win={window} jsonl_bind_failed: falling back to capture-pane", flush=True)
+
+            # 完了後に JSONL を1回読む（中間エントリではなく最終応答を取得）
             if jsonl_path:
-                # JSONL ポーリング（最大120秒）— wait_for_completion は不要
-                for _ in range(240):
-                    await asyncio.sleep(0.5)
-                    try:
-                        new_size = await asyncio.to_thread(os.path.getsize, jsonl_path)
-                        if new_size > jsonl_offset:
-                            text = await asyncio.to_thread(
-                                _read_assistant_text_since, jsonl_path, jsonl_offset
-                            )
-                            if text:
-                                result = text
-                                break
-                    except Exception:
-                        pass
+                text = await asyncio.to_thread(
+                    _read_assistant_text_since, jsonl_path, jsonl_offset
+                )
+                if text:
+                    result = text
                 print(f"[worker] win={window} jsonl result {len(result)} chars", flush=True)
 
             # JSONL が使えない or 空 → capture-pane フォールバック
             if not result:
-                await wait_for_completion(window)
                 raw = await tmux_capture(window, scrollback=1000)
                 print(f"[worker] win={window} pane fallback {len(raw)} chars", flush=True)
                 result = extract_final_result(raw)
