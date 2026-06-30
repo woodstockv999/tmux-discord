@@ -154,6 +154,12 @@ def is_idle(raw: str) -> bool:
     return False
 
 
+def is_waiting_for_input(raw: str) -> bool:
+    """Claude Code がユーザー入力待ちのインタラクティブダイアログを表示中か判定。"""
+    clean = strip_ansi(raw)
+    return bool(re.search(r'Enter to confirm|Esc to cancel|Do you want to proceed', clean))
+
+
 def extract_final_result(raw: str) -> str:
     """
     tmuxキャプチャからClaude Codeの最終応答テキストのみを抽出。
@@ -367,8 +373,12 @@ async def wait_for_completion(window: int, timeout: int = 300) -> str:
             stable = 0
             prev = cur
 
+        cur_now = await tmux_capture(window)
+        # インタラクティブダイアログ検出: 1秒安定で早期リターン → Discordに通知
+        if stable >= 2 and is_waiting_for_input(cur_now):
+            return cur
         # アイドル判定は現在画面のみ（scrollback の古い ⎿  $ を除外するため）
-        if stable >= 6 and is_idle(await tmux_capture(window)):
+        if stable >= 6 and is_idle(cur_now):
             return cur
 
     return prev
@@ -445,15 +455,20 @@ async def _window_worker(window: int) -> None:
 
             # JSONL が使えない or 空 → capture-pane フォールバック
             if not result:
-                raw = await tmux_capture(window, scrollback=1000)
+                raw = await tmux_capture(window, scrollback=100)
                 print(f"[worker] win={window} pane fallback {len(raw)} chars", flush=True)
-                result = extract_final_result(raw)
-                # 起動テキスト・bash プロンプトのみなら送信しない
-                if result and STARTUP_RE.search(result):
-                    print(f"[worker] win={window} pane result skipped (startup text)", flush=True)
-                    result = ""
+                if is_waiting_for_input(raw):
+                    # インタラクティブダイアログはpane全体をそのまま送信
+                    result = truncate(strip_ansi(raw))
+                    print(f"[worker] win={window} interactive dialog, sending pane", flush=True)
                 else:
-                    print(f"[worker] win={window} pane result {len(result)} chars: {repr(result[:60])}", flush=True)
+                    result = extract_final_result(raw)
+                    # 起動テキスト・bash プロンプトのみなら送信しない
+                    if result and STARTUP_RE.search(result):
+                        print(f"[worker] win={window} pane result skipped (startup text)", flush=True)
+                        result = ""
+                    else:
+                        print(f"[worker] win={window} pane result {len(result)} chars: {repr(result[:60])}", flush=True)
 
             if result:
                 chunks = split_chunks(result)
