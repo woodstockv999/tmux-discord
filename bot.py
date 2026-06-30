@@ -350,6 +350,44 @@ def _read_assistant_text_since(jsonl_path: str, offset: int) -> str:
         return ""
 
 
+def _read_final_assistant_text_since(jsonl_path: str, offset: int) -> tuple[str, bool]:
+    """JSONL の offset 以降を読み、(last_text, is_final) を返す。
+    is_final=True: 最後の assistant エントリに tool_use ブロックがない（最終応答）。
+    """
+    try:
+        with open(jsonl_path, 'rb') as f:
+            f.seek(offset)
+            new_content = f.read().decode('utf-8', errors='replace')
+        last_text = ""
+        last_has_tool_use = True  # まだ最終エントリを見ていない → False にならない
+        found_any = False
+        for line in new_content.splitlines():
+            try:
+                obj = json.loads(line)
+                if obj.get('type') == 'assistant':
+                    found_any = True
+                    has_tool_use = False
+                    candidate_text = ""
+                    for block in obj.get('message', {}).get('content', []):
+                        if not isinstance(block, dict):
+                            continue
+                        if block.get('type') == 'tool_use':
+                            has_tool_use = True
+                        elif block.get('type') == 'text':
+                            t = block.get('text', '').strip()
+                            if t and not FEEDBACK_RE.search(t):
+                                candidate_text = t
+                    last_has_tool_use = has_tool_use
+                    if candidate_text:
+                        last_text = candidate_text
+            except Exception:
+                pass
+        is_final = found_any and not last_has_tool_use
+        return (last_text, is_final)
+    except Exception:
+        return ("", False)
+
+
 # ── 完了待機 ──────────────────────────────────────────────────
 
 async def wait_for_completion(window: int, timeout: int = 300) -> str:
@@ -418,43 +456,54 @@ async def _window_worker(window: int) -> None:
         try:
             result = ""
 
-            # JSONL バインドと wait_for_completion を並列実行
-            async def _bind_session():
-                if not jsonl_dir:
-                    return None
-                session = await asyncio.to_thread(
+            # まず JSONL セッションファイルをバインド（最大 8 秒）
+            if jsonl_dir:
+                bind_result = await asyncio.to_thread(
                     _find_session_jsonl_sync, jsonl_dir, content, known_sizes, send_time
                 )
-                return session
+                if bind_result:
+                    jsonl_path, jsonl_offset = bind_result
+                else:
+                    print(f"[worker] win={window} jsonl_bind_failed: falling back to capture-pane", flush=True)
 
-            bind_result, _ = await asyncio.gather(
-                _bind_session(), wait_for_completion(window)
-            )
-            if bind_result:
-                jsonl_path, jsonl_offset = bind_result
-            else:
-                print(f"[worker] win={window} jsonl_bind_failed: falling back to capture-pane", flush=True)
-
-            # 完了後に JSONL を1回読む（中間エントリではなく最終応答を取得）
             if jsonl_path:
-                text = await asyncio.to_thread(
-                    _read_assistant_text_since, jsonl_path, jsonl_offset
-                )
-                if text:
-                    result = text
-                print(f"[worker] win={window} jsonl result {len(result)} chars", flush=True)
+                # JSONL ポーリング: 最終 assistant エントリ（tool_use なし）が来るまで待つ
+                # 最大 120 秒、0.5 秒ごとに確認
+                for _ in range(240):
+                    await asyncio.sleep(0.5)
+                    # インタラクティブダイアログ検出（ツール実行前の確認など）
+                    try:
+                        pane_raw = await tmux_capture(window)
+                        if is_waiting_for_input(pane_raw):
+                            result = truncate(strip_ansi(pane_raw))
+                            print(f"[worker] win={window} interactive dialog detected during jsonl poll", flush=True)
+                            break
+                    except Exception:
+                        pass
+                    # JSONL から最終エントリを確認
+                    try:
+                        text, is_final = await asyncio.to_thread(
+                            _read_final_assistant_text_since, jsonl_path, jsonl_offset
+                        )
+                        if text and is_final:
+                            result = text
+                            print(f"[worker] win={window} jsonl final entry {len(result)} chars", flush=True)
+                            break
+                    except Exception:
+                        pass
+                else:
+                    print(f"[worker] win={window} jsonl poll timeout", flush=True)
 
             # JSONL が使えない or 空 → capture-pane フォールバック
             if not result:
+                await wait_for_completion(window)
                 raw = await tmux_capture(window, scrollback=100)
                 print(f"[worker] win={window} pane fallback {len(raw)} chars", flush=True)
                 if is_waiting_for_input(raw):
-                    # インタラクティブダイアログはpane全体をそのまま送信
                     result = truncate(strip_ansi(raw))
                     print(f"[worker] win={window} interactive dialog, sending pane", flush=True)
                 else:
                     result = extract_final_result(raw)
-                    # 起動テキスト・bash プロンプトのみなら送信しない
                     if result and STARTUP_RE.search(result):
                         print(f"[worker] win={window} pane result skipped (startup text)", flush=True)
                         result = ""
