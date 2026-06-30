@@ -405,16 +405,8 @@ async def _window_worker(window: int) -> None:
             print(f"[worker] win={window} pre_err: {e}", flush=True)
 
         send_time = time.time()
-        is_enter_only = (content == "\x00ENTER")
         try:
-            if is_enter_only:
-                await asyncio.to_thread(
-                    subprocess.run,
-                    ["tmux", "send-keys", "-t", f"{TMUX_SESSION}:{window}", "Enter"],
-                    check=True,
-                )
-            else:
-                await tmux_send(window, content)
+            await tmux_send(window, content)
         except subprocess.CalledProcessError as e:
             print(f"[worker] win={window} send_error: {e}", flush=True)
             try:
@@ -427,9 +419,8 @@ async def _window_worker(window: int) -> None:
             result = ""
 
             # JSONL バインドと wait_for_completion を並列実行
-            # !enter はテキストがないためバインドをスキップし完了待ちのみ
             async def _bind_session():
-                if not jsonl_dir or is_enter_only:
+                if not jsonl_dir:
                     return None
                 session = await asyncio.to_thread(
                     _find_session_jsonl_sync, jsonl_dir, content, known_sizes, send_time
@@ -441,7 +432,7 @@ async def _window_worker(window: int) -> None:
             )
             if bind_result:
                 jsonl_path, jsonl_offset = bind_result
-            elif not is_enter_only:
+            else:
                 print(f"[worker] win={window} jsonl_bind_failed: falling back to capture-pane", flush=True)
 
             # 完了後に JSONL を1回読む（中間エントリではなく最終応答を取得）
@@ -565,11 +556,10 @@ async def on_message(message: discord.Message):
         content = message.content.strip()
 
         if content == "!enter":
-            await message.channel.send("⌛️")
-            q = window_queues.setdefault(window, asyncio.Queue())
-            await q.put((message, "\x00ENTER"))
-            if window not in window_workers or window_workers[window].done():
-                window_workers[window] = asyncio.create_task(_window_worker(window))
+            await asyncio.to_thread(subprocess.run, ["tmux", "send-keys", "-t", f"{TMUX_SESSION}:{window}", "Enter"])
+            await asyncio.sleep(2.5)
+            out = truncate(strip_ansi(await tmux_capture(window, scrollback=50)))
+            await message.reply(f"```\n{out}\n```")
             return
 
         if content.startswith("!key "):
