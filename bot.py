@@ -310,6 +310,20 @@ async def _window_worker(window: int) -> None:
     while not q.empty():
         message, content = await q.get()
         print(f"[worker] win={window} dequeue: {repr(content[:40])}", flush=True)
+
+        # JSONL offset を tmux_send より前に記録（後だと Claude Code がすぐ書いてずれる）
+        jsonl_path_pre = None
+        jsonl_offset = 0
+        jsonl_dir = None
+        try:
+            cwd = await asyncio.to_thread(_get_pane_cwd_sync, window)
+            jsonl_dir = _jsonl_dir_for_cwd(cwd)
+            state = await asyncio.to_thread(_latest_jsonl_state, jsonl_dir)
+            if state:
+                jsonl_path_pre, jsonl_offset = state
+        except Exception as e:
+            print(f"[worker] win={window} jsonl_pre_err: {e}", flush=True)
+
         try:
             await tmux_send(window, content)
         except subprocess.CalledProcessError as e:
@@ -321,34 +335,37 @@ async def _window_worker(window: int) -> None:
             continue
 
         try:
-            # 送信前に JSONL ファイルの状態を記録
-            cwd = await asyncio.to_thread(_get_pane_cwd_sync, window)
-            jsonl_dir = _jsonl_dir_for_cwd(cwd)
-            jsonl_state = await asyncio.to_thread(_latest_jsonl_state, jsonl_dir)
-            print(f"[worker] win={window} jsonl_dir={jsonl_dir} state={jsonl_state}", flush=True)
-
             await wait_for_completion(window)
 
-            # まず JSONL から応答を取得（capture-pane より確実）
             result = ""
-            if jsonl_state:
-                jsonl_path, offset = jsonl_state
-                # セッションが変わった場合は最新の JSONL を探す
-                new_state = await asyncio.to_thread(_latest_jsonl_state, jsonl_dir)
-                if new_state:
-                    new_path, new_size = new_state
-                    read_path = new_path
-                    read_offset = offset if new_path == jsonl_path else 0
-                    if new_size > read_offset:
-                        result = await asyncio.to_thread(_read_assistant_text_since, read_path, read_offset)
-                        print(f"[worker] win={window} jsonl result {len(result)} chars", flush=True)
 
-            # JSONL で取れなければ capture-pane フォールバック
+            if jsonl_path_pre and jsonl_dir:
+                # JSONL ポーリング: wait_for_completion 後も最大30秒待機
+                # （Claude Code の JSONL 書き込みが ❯ 表示より遅れる場合に対応）
+                for _ in range(60):
+                    await asyncio.sleep(0.5)
+                    try:
+                        new_state = await asyncio.to_thread(_latest_jsonl_state, jsonl_dir)
+                        if new_state:
+                            new_path, new_size = new_state
+                            read_offset = jsonl_offset if new_path == jsonl_path_pre else 0
+                            if new_size > read_offset:
+                                text = await asyncio.to_thread(
+                                    _read_assistant_text_since, new_path, read_offset
+                                )
+                                if text:
+                                    result = text
+                                    break
+                    except Exception:
+                        pass
+                print(f"[worker] win={window} jsonl result {len(result)} chars", flush=True)
+
+            # JSONL が使えない or 空 → capture-pane フォールバック（非 Claude Code ウィンドウ用）
             if not result:
                 raw = await tmux_capture(window, scrollback=1000)
-                print(f"[worker] win={window} captured {len(raw)} chars (fallback)", flush=True)
+                print(f"[worker] win={window} pane fallback {len(raw)} chars", flush=True)
                 result = extract_final_result(raw)
-                print(f"[worker] win={window} fallback result {len(result)} chars: {repr(result[:60])}", flush=True)
+                print(f"[worker] win={window} pane result {len(result)} chars: {repr(result[:60])}", flush=True)
 
             if result:
                 chunks = split_chunks(result)
