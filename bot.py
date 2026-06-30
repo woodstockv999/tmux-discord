@@ -33,6 +33,8 @@ PROMPT_RE = re.compile(r'^\s*[>$#%❯]\s*$|.+[#$]\s*$')
 CLAUDE_BUSY_RE = re.compile(r'Undulating|Working|Running|Thinking|\d+s\s*·|⎿\s*\$')
 # Claude Code UI の装飾要素（区切り線・ステータスバー）
 CHROME_RE = re.compile(r'^[─━═╌╍┈┉\s]+$|⏵⏵|⏺⏺')
+# Claude Code セッション評価フィードバックプロンプト
+FEEDBACK_RE = re.compile(r'How is Claude doing this session|\d+:\s*(?:Bad|Fine|Good|Dismiss)')
 
 
 # ── 永続化 ────────────────────────────────────────────────────
@@ -158,22 +160,30 @@ def extract_final_result(raw: str) -> str:
     clean = strip_ansi(raw)
     lines = clean.splitlines()
 
-    # Claude Code モード: ● 応答ブロックを前向きスキャン（最後のものを採用）
-    result_lines: list[str] = []
+    # Claude Code モード: ● 応答ブロックを全収集し、フィードバックプロンプトを除外して最後を返す
+    blocks: list[list[str]] = []
+    current_block: list[str] = []
     in_response = False
     for line in lines:
         s = line.strip()
         if s.startswith('●'):
-            result_lines = [s[1:].strip()]  # ● を除去して新ブロック開始
+            if current_block:
+                blocks.append(current_block)
+            current_block = [s[1:].strip()]
             in_response = True
         elif in_response:
-            # ✻ (タイマー) / ⏺ (ツール呼び出し) / ❯ (プロンプト) で終了
             if s.startswith(('✻', '⏺', '❯', '⎿')) or CHROME_RE.search(line):
                 in_response = False
             else:
-                result_lines.append(line.rstrip())
+                current_block.append(line.rstrip())
+    if current_block:
+        blocks.append(current_block)
 
-    if result_lines:
+    # フィードバックプロンプトブロックを除外
+    blocks = [b for b in blocks if not FEEDBACK_RE.search('\n'.join(b))]
+
+    if blocks:
+        result_lines = blocks[-1]
         while result_lines and not result_lines[-1].strip():
             result_lines.pop()
         result = '\n'.join(result_lines).strip()
