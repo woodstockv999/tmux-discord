@@ -23,8 +23,6 @@ watch_tasks: dict[int, asyncio.Task] = {}
 # ウィンドウごとのメッセージキュー（同一ウィンドウは順番に処理）
 window_queues: dict[int, asyncio.Queue] = {}
 window_workers: dict[int, asyncio.Task] = {}
-# ウィンドウ → 専用 JSONL ファイルパスのキャッシュ（クロスウィンドウ汚染防止）
-_window_jsonl_cache: dict[int, str] = {}
 
 ANSI_RE = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
 # Claude Code のツール呼び出し行にマッチ（⏺ 等のアイコン、もしくは "ToolName(" で始まる行）
@@ -226,47 +224,28 @@ def extract_final_result(raw: str) -> str:
 
 # ── Claude JSONL 読み取り ──────────────────────────────────────
 
-def _find_jsonl_for_window_sync(window: int) -> str | None:
-    """
-    tmux ペインのプロセスツリーを辿り、Claude Code が開いている JSONL を特定する。
-    /proc/<pid>/fd のシンボリックリンクを読んで ~/.claude/projects/ 内の .jsonl を探す。
-    """
+def _get_pane_cwd_sync(window: int) -> str:
+    result = subprocess.run(
+        ["tmux", "display-message", "-t", f"{TMUX_SESSION}:{window}", "-p", "#{pane_current_path}"],
+        capture_output=True, text=True,
+    )
+    return result.stdout.strip()
+
+
+def _jsonl_dir_for_cwd(cwd: str) -> str:
+    project = cwd.replace('/', '-')
+    return os.path.expanduser(f"~/.claude/projects/{project}")
+
+
+def _latest_jsonl_state(directory: str) -> tuple[str, int] | None:
+    """最近変更された JSONL ファイルのパスと現在サイズを返す。"""
     try:
-        result = subprocess.run(
-            ["tmux", "display-message", "-t", f"{TMUX_SESSION}:{window}", "-p", "#{pane_pid}"],
-            capture_output=True, text=True,
-        )
-        shell_pid = result.stdout.strip()
-        if not shell_pid:
+        import glob as _glob
+        files = _glob.glob(os.path.join(directory, "*.jsonl"))
+        if not files:
             return None
-
-        # BFS でシェル配下の全子孫 PID を列挙
-        all_pids: list[str] = []
-        queue = [shell_pid]
-        while queue:
-            pid = queue.pop(0)
-            all_pids.append(pid)
-            res = subprocess.run(
-                ["ps", "-o", "pid=", "--ppid", pid],
-                capture_output=True, text=True,
-            )
-            children = [p.strip() for p in res.stdout.strip().split() if p.strip()]
-            queue.extend(children)
-
-        claude_projects = os.path.expanduser("~/.claude/projects")
-        for pid in all_pids:
-            fd_dir = f"/proc/{pid}/fd"
-            try:
-                for fd_name in os.listdir(fd_dir):
-                    try:
-                        target = os.readlink(os.path.join(fd_dir, fd_name))
-                        if target.endswith('.jsonl') and target.startswith(claude_projects):
-                            return target
-                    except OSError:
-                        pass
-            except OSError:
-                pass
-        return None
+        path = max(files, key=os.path.getmtime)
+        return (path, os.path.getsize(path))
     except Exception:
         return None
 
@@ -332,15 +311,16 @@ async def _window_worker(window: int) -> None:
         message, content = await q.get()
         print(f"[worker] win={window} dequeue: {repr(content[:40])}", flush=True)
 
-        # このウィンドウ専用の JSONL を特定してから offset を記録
-        # キャッシュ済みかつファイルが存在すればそのまま使う。なければプロセスから再探索。
+        # tmux_send より前に JSONL ファイルとオフセットを確定させる
+        # → ポーリング中に他ウィンドウの書き込みで「最近更新ファイル」が変わっても影響なし
         jsonl_path_pre = None
         jsonl_offset = 0
         try:
-            cached = _window_jsonl_cache.get(window)
-            if cached and os.path.exists(cached):
-                jsonl_path_pre = cached
-                jsonl_offset = os.path.getsize(jsonl_path_pre)
+            cwd = await asyncio.to_thread(_get_pane_cwd_sync, window)
+            jsonl_dir = _jsonl_dir_for_cwd(cwd)
+            state = await asyncio.to_thread(_latest_jsonl_state, jsonl_dir)
+            if state:
+                jsonl_path_pre, jsonl_offset = state
         except Exception as e:
             print(f"[worker] win={window} jsonl_pre_err: {e}", flush=True)
 
@@ -355,18 +335,6 @@ async def _window_worker(window: int) -> None:
             continue
 
         try:
-            # キャッシュ未確定の場合は送信直後（Claude Code がアクティブな今）に /proc/fd を探す
-            if not jsonl_path_pre:
-                try:
-                    found = await asyncio.to_thread(_find_jsonl_for_window_sync, window)
-                    if found:
-                        _window_jsonl_cache[window] = found
-                        jsonl_path_pre = found
-                        jsonl_offset = os.path.getsize(found)
-                        print(f"[worker] win={window} jsonl_discovered={found}", flush=True)
-                except Exception as e:
-                    print(f"[worker] win={window} jsonl_discover_err: {e}", flush=True)
-
             await wait_for_completion(window)
 
             result = ""
