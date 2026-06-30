@@ -50,25 +50,33 @@ def save_map():
 
 # ── tmux helpers ──────────────────────────────────────────────
 
-def tmux_send(window: int, text: str) -> None:
-    """テキストをtmuxペインに送信し、Enterを確実に押す"""
+def _tmux_send_sync(window: int, text: str) -> None:
     subprocess.run(
         ["tmux", "send-keys", "-t", f"{TMUX_SESSION}:{window}", "--", text],
         check=True,
     )
-    # Enterを別コマンドで送ることで送信を確実にする
     subprocess.run(
         ["tmux", "send-keys", "-t", f"{TMUX_SESSION}:{window}", "Enter"],
         check=True,
     )
 
 
-def tmux_capture(window: int, scrollback: int = 0) -> str:
+def _tmux_capture_sync(window: int, scrollback: int = 0) -> str:
     cmd = ["tmux", "capture-pane", "-t", f"{TMUX_SESSION}:{window}", "-p"]
     if scrollback:
         cmd += ["-S", f"-{scrollback}"]
     result = subprocess.run(cmd, capture_output=True, text=True)
     return result.stdout
+
+
+async def tmux_send(window: int, text: str) -> None:
+    """イベントループをブロックしない tmux 送信"""
+    await asyncio.to_thread(_tmux_send_sync, window, text)
+
+
+async def tmux_capture(window: int, scrollback: int = 0) -> str:
+    """イベントループをブロックしない tmux キャプチャ"""
+    return await asyncio.to_thread(_tmux_capture_sync, window, scrollback)
 
 
 def tmux_windows() -> list[dict]:
@@ -190,7 +198,7 @@ async def wait_for_completion(window: int, timeout: int = 300) -> str:
 
     for _ in range(timeout * 2):  # 0.5秒ごとにポーリング
         await asyncio.sleep(0.5)
-        cur = tmux_capture(window, scrollback=100)
+        cur = await tmux_capture(window, scrollback=100)
 
         if cur == prev:
             stable += 1
@@ -199,7 +207,7 @@ async def wait_for_completion(window: int, timeout: int = 300) -> str:
             prev = cur
 
         # アイドル判定は現在画面のみ（scrollback の古い ⎿  $ を除外するため）
-        if stable >= 6 and is_idle(tmux_capture(window)):
+        if stable >= 6 and is_idle(await tmux_capture(window)):
             return cur
 
     return prev
@@ -208,10 +216,10 @@ async def wait_for_completion(window: int, timeout: int = 300) -> str:
 # ── watch loop ────────────────────────────────────────────────
 
 async def watch_loop(window: int, thread: discord.Thread):
-    last = tmux_capture(window)
+    last = await tmux_capture(window)
     while True:
         await asyncio.sleep(2)
-        cur = tmux_capture(window)
+        cur = await tmux_capture(window)
         if cur != last:
             try:
                 await thread.send(f"```\n{truncate(strip_ansi(cur))}\n```")
@@ -283,22 +291,22 @@ async def on_message(message: discord.Message):
         content = message.content.strip()
 
         if content == "!enter":
-            subprocess.run(["tmux", "send-keys", "-t", f"{TMUX_SESSION}:{window}", "Enter"])
+            await asyncio.to_thread(subprocess.run, ["tmux", "send-keys", "-t", f"{TMUX_SESSION}:{window}", "Enter"])
             await asyncio.sleep(0.5)
-            out = truncate(strip_ansi(tmux_capture(window)))
+            out = truncate(strip_ansi(await tmux_capture(window)))
             await message.reply(f"```\n{out}\n```")
             return
 
         if content.startswith("!key "):
             key = content[5:].strip()
-            subprocess.run(["tmux", "send-keys", "-t", f"{TMUX_SESSION}:{window}", key])
+            await asyncio.to_thread(subprocess.run, ["tmux", "send-keys", "-t", f"{TMUX_SESSION}:{window}", key])
             await asyncio.sleep(0.5)
-            out = truncate(strip_ansi(tmux_capture(window)))
+            out = truncate(strip_ansi(await tmux_capture(window)))
             await message.reply(f"```\n{out}\n```")
             return
 
         if content == "!cap":
-            out = truncate(strip_ansi(tmux_capture(window, scrollback=50)))
+            out = truncate(strip_ansi(await tmux_capture(window, scrollback=50)))
             await message.reply(f"```\n{out}\n```")
             return
 
@@ -326,7 +334,7 @@ async def on_message(message: discord.Message):
 
         # ── 通常テキスト: tmuxへ送信 ──────────────────────────
         try:
-            tmux_send(window, content)
+            await tmux_send(window, content)
         except subprocess.CalledProcessError as e:
             await message.reply(f"tmux送信エラー: {e}")
             return
