@@ -195,7 +195,7 @@ def extract_final_result(raw: str) -> str:
     filtered = []
     for line in lines:
         s = line.strip()
-        if CHROME_RE.search(line) or PROMPT_RE.match(s):
+        if CHROME_RE.search(line) or PROMPT_RE.match(s) or FEEDBACK_RE.search(s):
             continue
         if s.startswith(('✻', '⏺', '❯', '⎿', '●')):
             filtered.append(None)  # ブロック区切りマーカー
