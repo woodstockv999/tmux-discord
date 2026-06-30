@@ -248,23 +248,38 @@ async def _window_worker(window: int) -> None:
     q = window_queues[window]
     while not q.empty():
         message, content = await q.get()
+        print(f"[worker] win={window} dequeue: {repr(content[:40])}", flush=True)
         try:
             await tmux_send(window, content)
         except subprocess.CalledProcessError as e:
-            await message.reply(f"tmux送信エラー: {e}")
+            print(f"[worker] win={window} send_error: {e}", flush=True)
+            try:
+                await message.reply(f"tmux送信エラー: {e}")
+            except Exception:
+                pass
             continue
 
-        await wait_for_completion(window)
-        # 安定確認後に大きめのスクロールバックで全量を取得
-        raw = await tmux_capture(window, scrollback=1000)
-        result = extract_final_result(raw)
-        if result:
-            chunks = split_chunks(result)
-            await message.reply(f"```\n{chunks[0]}\n```")
-            for chunk in chunks[1:]:
-                await message.channel.send(f"```\n{chunk}\n```")
-        else:
-            await message.reply("（出力なし）")
+        try:
+            await wait_for_completion(window)
+            raw = await tmux_capture(window, scrollback=1000)
+            print(f"[worker] win={window} captured {len(raw)} chars", flush=True)
+            result = extract_final_result(raw)
+            print(f"[worker] win={window} result {len(result)} chars: {repr(result[:60])}", flush=True)
+            if result:
+                chunks = split_chunks(result)
+                print(f"[worker] win={window} sending {len(chunks)} chunk(s)", flush=True)
+                await message.reply(f"```\n{chunks[0]}\n```")
+                for chunk in chunks[1:]:
+                    await message.channel.send(f"```\n{chunk}\n```")
+            else:
+                await message.reply("（出力なし）")
+        except Exception as e:
+            print(f"[worker] win={window} exception: {e}", flush=True)
+            import traceback; traceback.print_exc()
+            try:
+                await message.reply(f"エラー: {e}")
+            except Exception:
+                pass
 
 
 # ── watch loop ────────────────────────────────────────────────
