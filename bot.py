@@ -589,6 +589,13 @@ def is_main_channel(message: discord.Message) -> bool:
 def get_thread_window(message: discord.Message) -> int | None:
     if not isinstance(message.channel, discord.Thread):
         return None
+    if message.author.bot:
+        return None
+    # スレッドは public_thread で作成されるため、チャンネルを見られる者は誰でも参加・投稿できる。
+    # 親チャンネルが ALLOWED_CHANNEL と一致することを確認しないと、認可チェックを完全に迂回して
+    # tmux（実シェル）へ任意コマンドを送信できてしまう。
+    if ALLOWED_CHANNEL and str(message.channel.parent_id) != ALLOWED_CHANNEL:
+        return None
     return thread_map.get(str(message.channel.id))
 
 
