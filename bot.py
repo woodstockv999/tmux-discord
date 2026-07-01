@@ -14,6 +14,11 @@ ALLOWED_CHANNEL = os.getenv("DISCORD_CHANNEL_ID") or None
 TMUX_SESSION = os.getenv("TMUX_SESSION", "0")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY") or None
 
+# タイムアウト（秒）
+CLAUDE_TIMEOUT = 1800   # Claude Code の1ターン待機上限
+SHELL_TIMEOUT = 120     # シェルコマンドの待機上限
+STATUS_INTERVAL = 120   # 実行中ステータスの更新間隔
+
 intents = discord.Intents.default()
 intents.message_content = True
 client = discord.Client(intents=intents)
@@ -24,20 +29,17 @@ watch_tasks: dict[int, asyncio.Task] = {}
 # ウィンドウごとのメッセージキュー（同一ウィンドウは順番に処理）
 window_queues: dict[int, asyncio.Queue] = {}
 window_workers: dict[int, asyncio.Task] = {}
+# ウィンドウ → バインド済み Claude セッション JSONL パス（Claude再起動まで再利用）
+window_jsonl: dict[int, str] = {}
 
 ANSI_RE = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
-# Claude Code のツール呼び出し行にマッチ（⏺ 等のアイコン、もしくは "ToolName(" で始まる行）
-TOOL_RE = re.compile(r'[⏺✓✗⚡◆▶]|^\s*(?:Bash|Read|Edit|Write|Search|Glob|Task|Agent|WebFetch|WebSearch)\(')
-# シェルプロンプト行（Claude Code の ❯ および bash の user@host:path$ 形式）
-PROMPT_RE = re.compile(r'^\s*[>$#%❯]\s*$|.+[#$]\s*$')
-# Claude Code が処理中であることを示すパターン
-CLAUDE_BUSY_RE = re.compile(r'Undulating|Working|Running|Thinking|\d+s\s*·|⎿\s*\$')
-# Claude Code UI の装飾要素（区切り線・ステータスバー）
-CHROME_RE = re.compile(r'^[─━═╌╍┈┉\s]+$|⏵⏵|⏺⏺')
+# Claude Code 実行中サイン: 経過タイマー付きステータス行 "(2m 33s · ..." または "esc to interrupt"。
+# スピナーの動詞はランダム語彙（Boogieing 等）なので単語列挙では検出できない。
+CLAUDE_BUSY_RE = re.compile(r'\(\s*(?:\d+h\s*)?(?:\d+m\s*)?\d+s\s*·|esc to interrupt')
 # Claude Code セッション評価フィードバックプロンプト
 FEEDBACK_RE = re.compile(r'How is Claude doing this session|\d+:\s*(?:Bad|Fine|Good|Dismiss)')
-# Claude Code / bash の起動・初期化テキスト（pane fallback で送信しない）
-STARTUP_RE = re.compile(r'Resume this session with:|Claude Code v\d|claude --dangerously')
+# シェルとして扱う pane_current_command
+SHELL_COMMANDS = {"bash", "zsh", "sh", "fish", "dash"}
 
 
 async def safe_reply(message: discord.Message, content: str) -> discord.Message:
@@ -87,14 +89,29 @@ def _tmux_capture_sync(window: int, scrollback: int = 0) -> str:
     return result.stdout
 
 
+def _pane_info_sync(window: int) -> tuple[str, str]:
+    """(pane_current_command, pane_current_path) を返す"""
+    result = subprocess.run(
+        ["tmux", "display-message", "-t", f"{TMUX_SESSION}:{window}", "-p",
+         "#{pane_current_command}\x1f#{pane_current_path}"],
+        capture_output=True, text=True,
+    )
+    parts = result.stdout.strip().split("\x1f")
+    if len(parts) == 2:
+        return parts[0], parts[1]
+    return "", ""
+
+
 async def tmux_send(window: int, text: str) -> None:
-    """イベントループをブロックしない tmux 送信"""
     await asyncio.to_thread(_tmux_send_sync, window, text)
 
 
 async def tmux_capture(window: int, scrollback: int = 0) -> str:
-    """イベントループをブロックしない tmux キャプチャ"""
     return await asyncio.to_thread(_tmux_capture_sync, window, scrollback)
+
+
+async def pane_info(window: int) -> tuple[str, str]:
+    return await asyncio.to_thread(_pane_info_sync, window)
 
 
 def tmux_windows() -> list[dict]:
@@ -129,8 +146,14 @@ def truncate(text: str, limit: int = 1800) -> str:
 
 
 def split_chunks(text: str, chunk_size: int = 1800) -> list[str]:
-    """テキストを行単位で chunk_size 以下のチャンクに分割する"""
-    lines = text.splitlines()
+    """テキストを行単位で chunk_size 以下のチャンクに分割する。
+    1行が chunk_size を超える場合はその行自体を強制分割する。"""
+    lines: list[str] = []
+    for line in text.splitlines():
+        while len(line) > chunk_size:
+            lines.append(line[:chunk_size])
+            line = line[chunk_size:]
+        lines.append(line)
     chunks: list[str] = []
     current: list[str] = []
     current_len = 0
@@ -147,23 +170,17 @@ def split_chunks(text: str, chunk_size: int = 1800) -> list[str]:
     return chunks or [""]
 
 
-def is_idle(raw: str) -> bool:
-    """
-    Claude Code / シェルがアイドル状態か判定。
-    処理中サイン（タイマー等）がなく、末尾10行以内に ❯ 単独行または
-    bash プロンプト行があればアイドルとみなす。
-    ステータスバー（⏵⏵ bypass...）が最終行に来るため末尾N行で判定する。
-    """
-    clean = strip_ansi(raw)
-    if CLAUDE_BUSY_RE.search(clean):
-        return False
-    lines = [l for l in clean.splitlines() if l.strip()]
+def is_claude_busy(raw: str) -> bool:
+    return bool(CLAUDE_BUSY_RE.search(strip_ansi(raw)))
+
+
+def is_shell_idle(raw: str) -> bool:
+    """シェルペインがプロンプトで止まっているか（末尾の非空行がプロンプト形状）"""
+    lines = [l.rstrip() for l in strip_ansi(raw).splitlines() if l.strip()]
     if not lines:
         return False
-    for line in lines[-10:]:
-        if re.search(r'^\s*[❯>$#%]\s*$|[#$]\s*$', line):
-            return True
-    return False
+    # % は zsh プロンプト用だが "45%" 等の進捗表示と衝突するため直前に空白を要求
+    return bool(re.search(r'[$#]\s*$|\s%\s*$', lines[-1]))
 
 
 def is_waiting_for_input(raw: str) -> bool:
@@ -172,86 +189,22 @@ def is_waiting_for_input(raw: str) -> bool:
     return bool(re.search(r'Enter to confirm|Esc to cancel|Do you want to proceed', clean))
 
 
-def extract_final_result(raw: str) -> str:
-    """
-    tmuxキャプチャからClaude Codeの最終応答テキストのみを抽出。
-    ● で始まる応答ブロックを前向きスキャンし、最後のブロックを返す。
-    ● がなければ bash 出力として旧ロジックにフォールバック。
-    """
-    clean = strip_ansi(raw)
-    lines = clean.splitlines()
-
-    # Claude Code モード: ● 応答ブロックを全収集し、フィードバックプロンプトを除外して最後を返す
-    blocks: list[list[str]] = []
-    current_block: list[str] = []
-    in_response = False
-    for line in lines:
-        s = line.strip()
-        if s.startswith('●'):
-            if current_block:
-                blocks.append(current_block)
-            current_block = [s[1:].strip()]
-            in_response = True
-        elif in_response:
-            if s.startswith(('✻', '⏺', '❯', '⎿')) or CHROME_RE.search(line):
-                in_response = False
-            else:
-                current_block.append(line.rstrip())
-    if current_block:
-        blocks.append(current_block)
-
-    # フィードバックプロンプトブロックを除外
-    blocks = [b for b in blocks if not FEEDBACK_RE.search('\n'.join(b))]
-
-    if blocks:
-        result_lines = blocks[-1]
-        while result_lines and not result_lines[-1].strip():
-            result_lines.pop()
-        result = '\n'.join(result_lines).strip()
-        if result:
-            return result  # 呼び出し側で split_chunks するので truncate しない
-
-    # ● がスクロールアウトしている場合: 末尾から ✻/❯ で区切られた
-    # 直近の応答テキストブロックを逆走査で取得
-    filtered = []
-    for line in lines:
-        s = line.strip()
-        if CHROME_RE.search(line) or PROMPT_RE.match(s) or FEEDBACK_RE.search(s):
-            continue
-        if s.startswith(('✻', '⏺', '❯', '⎿', '●')):
-            filtered.append(None)  # ブロック区切りマーカー
-        else:
-            filtered.append(line)
-
-    # 末尾の空行・マーカーを除去
-    while filtered and (filtered[-1] is None or not (filtered[-1] or '').strip()):
-        filtered.pop()
-
-    # マーカーで分割し最後のブロックを取得
-    last_block: list[str] = []
-    for item in reversed(filtered):
-        if item is None:
-            if last_block:
-                break
-        else:
-            last_block.insert(0, item)
-
-    while last_block and not last_block[0].strip():
-        last_block.pop(0)
-
-    result = "\n".join(last_block).strip()
-    return result if result else ""
+def line_diff(before: str, after: str) -> str:
+    """スクロールバッファの追記分を取り出す。before と共通する行プレフィックス以降を返す。"""
+    b = before.splitlines()
+    a = after.splitlines()
+    # before 末尾の空行はプロンプト再描画で変わるため無視して比較
+    while b and not b[-1].strip():
+        b.pop()
+    common = 0
+    for x, y in zip(b, a):
+        if x != y:
+            break
+        common += 1
+    return "\n".join(a[common:]).strip("\n")
 
 
 # ── Claude JSONL 読み取り ──────────────────────────────────────
-
-def _get_pane_cwd_sync(window: int) -> str:
-    result = subprocess.run(
-        ["tmux", "display-message", "-t", f"{TMUX_SESSION}:{window}", "-p", "#{pane_current_path}"],
-        capture_output=True, text=True,
-    )
-    return result.stdout.strip()
-
 
 def _jsonl_dir_for_cwd(cwd: str) -> str:
     project = cwd.replace('/', '-')
@@ -271,28 +224,56 @@ def _scan_jsonl_dir_sync(directory: str) -> dict[str, int]:
 _jsonl_claimed_size: dict[str, int] = {}
 
 
+def _entry_matches_user_text(obj: dict, user_text: str, send_time: float) -> bool:
+    """JSONL の user エントリが、送信したテキストに対応するか判定"""
+    from datetime import datetime
+
+    if obj.get('type') != 'user':
+        return False
+    ts_str = obj.get('timestamp', '')
+    if ts_str:
+        try:
+            ts = datetime.fromisoformat(ts_str.replace('Z', '+00:00')).timestamp()
+            if ts < send_time - 5.0:
+                return False
+        except Exception:
+            pass
+    match_text = user_text.strip()[:200]
+    content_list = obj.get('message', {}).get('content', []) or []
+    items = [content_list] if isinstance(content_list, str) else content_list
+    for block in items:
+        entry_text = (
+            block if isinstance(block, str)
+            else (block.get('text', '') if isinstance(block, dict) and block.get('type') == 'text' else '')
+        ).strip()
+        if not entry_text:
+            continue
+        if (match_text and match_text in entry_text) or (entry_text and entry_text in user_text):
+            return True
+    return False
+
+
 def _find_session_jsonl_sync(
     directory: str,
     user_text: str,
     known_sizes: dict[str, int],
     send_time: float,
-    timeout: float = 8.0,
+    timeout: float = 15.0,
+    only_path: str | None = None,
 ) -> tuple[str, int] | None:
     """
     メッセージ送信後、どのJSONLファイルがそのメッセージを受け取ったかを特定する。
-    user entry のタイムスタンプ（≥ send_time - 5s）とテキスト内容でマッチング。
+    only_path 指定時はそのファイルだけを確認する（バインドキャッシュの検証用）。
     戻り値: (path, pre_send_offset) — 送信前のファイルサイズをオフセットとして返す。
-    全ウィンドウが同じ ~/.claude/projects/<cwd>/ を共有する問題の根本修正。
     """
     import glob as _glob
-    from datetime import datetime, timezone
 
     deadline = time.monotonic() + timeout
-    # 誤マッチ低減のため 80→200 文字に拡大（短い/類似メッセージ同士の取り違え対策）
-    match_text = user_text.strip()[:200]
-
     while time.monotonic() < deadline:
-        files = _glob.glob(os.path.join(directory, "*.jsonl"))
+        if only_path:
+            files = [only_path]
+        else:
+            files = _glob.glob(os.path.join(directory, "*.jsonl"))
         for path in files:
             try:
                 known = known_sizes.get(path, 0)
@@ -307,37 +288,9 @@ def _find_session_jsonl_sync(
                     new_content = f.read().decode('utf-8', errors='replace')
                 for line in new_content.splitlines():
                     try:
-                        obj = json.loads(line)
-                        if obj.get('type') != 'user':
-                            continue
-                        # タイムスタンプフィルタ: 送信5秒前以降のエントリのみ
-                        ts_str = obj.get('timestamp', '')
-                        if ts_str:
-                            try:
-                                ts = datetime.fromisoformat(
-                                    ts_str.replace('Z', '+00:00')
-                                ).timestamp()
-                                if ts < send_time - 5.0:
-                                    continue
-                            except Exception:
-                                pass
-                        # テキスト内容マッチング
-                        content_list = obj.get('message', {}).get('content', []) or []
-                        matched = False
-                        items = [content_list] if isinstance(content_list, str) else content_list
-                        for block in items:
-                            entry_text = (
-                                block if isinstance(block, str)
-                                else (block.get('text', '') if isinstance(block, dict) and block.get('type') == 'text' else '')
-                            ).strip()
-                            if not entry_text:
-                                continue
-                            if (match_text and match_text in entry_text) or (entry_text and entry_text in user_text):
-                                matched = True
-                                break
-                        if matched:
+                        if _entry_matches_user_text(json.loads(line), user_text, send_time):
                             _jsonl_claimed_size[path] = current_size
-                            print(f"[jsonl] bound {os.path.basename(path)} for text={repr(match_text[:30])}", flush=True)
+                            print(f"[jsonl] bound {os.path.basename(path)} for text={repr(user_text.strip()[:30])}", flush=True)
                             return (path, known)
                     except Exception:
                         pass
@@ -347,99 +300,196 @@ def _find_session_jsonl_sync(
     return None
 
 
-def _read_assistant_text_since(jsonl_path: str, offset: int) -> str:
-    """JSONL の offset 以降から最後の assistant テキストブロックを返す。"""
+def _read_turn_result_sync(jsonl_path: str, offset: int) -> str:
+    """
+    JSONL の offset 以降を読み、「最後のツールイベント以降のテキスト」を結合して返す。
+    assistant エントリはブロックごとに分割記録されるため、途中テキストは後続の
+    tool_use / tool_result 出現時にリセットされ、ターン末尾のテキストだけが残る。
+    """
     try:
         with open(jsonl_path, 'rb') as f:
             f.seek(offset)
             new_content = f.read().decode('utf-8', errors='replace')
-        last_text = ""
+        texts: list[str] = []
         for line in new_content.splitlines():
             try:
                 obj = json.loads(line)
-                if obj.get('type') == 'assistant':
-                    for block in obj.get('message', {}).get('content', []):
-                        if isinstance(block, dict) and block.get('type') == 'text':
-                            text = block.get('text', '').strip()
-                            if text and not FEEDBACK_RE.search(text):
-                                last_text = text
+                otype = obj.get('type')
+                if otype not in ('assistant', 'user'):
+                    continue
+                content = obj.get('message', {}).get('content', [])
+                if not isinstance(content, list):
+                    continue
+                for block in content:
+                    if not isinstance(block, dict):
+                        continue
+                    btype = block.get('type')
+                    if btype in ('tool_use', 'tool_result'):
+                        texts = []  # ツールイベント → ここまでのテキストは途中経過
+                    elif btype == 'text' and otype == 'assistant':
+                        t = block.get('text', '').strip()
+                        if t and not FEEDBACK_RE.search(t):
+                            texts.append(t)
             except Exception:
                 pass
-        return last_text
+        return "\n\n".join(texts).strip()
     except Exception:
         return ""
 
 
-def _read_final_assistant_text_since(jsonl_path: str, offset: int) -> tuple[str, bool]:
-    """JSONL の offset 以降を読み、(last_text, is_final) を返す。
-    is_final=True: 最後の assistant エントリに tool_use ブロックがない（最終応答）。
-    """
+# ── 実行パイプライン ──────────────────────────────────────────
+
+async def update_status(status_msg: discord.Message | None, text: str) -> None:
+    if status_msg is None:
+        return
     try:
-        with open(jsonl_path, 'rb') as f:
-            f.seek(offset)
-            new_content = f.read().decode('utf-8', errors='replace')
-        last_text = ""
-        last_has_tool_use = True  # まだ最終エントリを見ていない → False にならない
-        found_any = False
-        for line in new_content.splitlines():
-            try:
-                obj = json.loads(line)
-                if obj.get('type') == 'assistant':
-                    found_any = True
-                    has_tool_use = False
-                    candidate_text = ""
-                    for block in obj.get('message', {}).get('content', []):
-                        if not isinstance(block, dict):
-                            continue
-                        if block.get('type') == 'tool_use':
-                            has_tool_use = True
-                        elif block.get('type') == 'text':
-                            t = block.get('text', '').strip()
-                            if t and not FEEDBACK_RE.search(t):
-                                candidate_text = t
-                    last_has_tool_use = has_tool_use
-                    if candidate_text:
-                        last_text = candidate_text
-            except Exception:
-                pass
-        is_final = found_any and not last_has_tool_use
-        return (last_text, is_final)
+        await status_msg.edit(content=text)
     except Exception:
-        return ("", False)
+        pass
 
 
-# ── 完了待機 ──────────────────────────────────────────────────
+async def send_result(message: discord.Message, text: str) -> None:
+    chunks = split_chunks(text)
+    print(f"[worker] sending {len(chunks)} chunk(s), {len(text)} chars", flush=True)
+    await safe_reply(message, f"```\n{chunks[0]}\n```")
+    for chunk in chunks[1:]:
+        await message.channel.send(f"```\n{chunk}\n```")
 
-async def wait_for_completion(window: int, timeout: int = 300) -> str:
-    """
-    tmuxペインの出力が安定 かつ プロンプト行で終わるまで待機。
-    timeout秒経過したら最後のキャプチャを返す。
-    """
-    # コマンドが処理開始するまで少し待つ
-    await asyncio.sleep(1.0)
+
+async def run_shell_command(window: int, message: discord.Message,
+                            status_msg: discord.Message | None, content: str) -> None:
+    """シェルペイン: 送信 → プロンプト復帰まで待機 → スクロールバッファ差分を返信"""
+    before = await tmux_capture(window, scrollback=2000)
+    await tmux_send(window, content)
 
     prev = ""
     stable = 0
-
-    for _ in range(timeout * 2):  # 0.5秒ごとにポーリング
+    start = time.monotonic()
+    completed = False
+    while time.monotonic() - start < SHELL_TIMEOUT:
         await asyncio.sleep(0.5)
-        cur = await tmux_capture(window, scrollback=100)
-
+        cur = await tmux_capture(window)
         if cur == prev:
             stable += 1
         else:
             stable = 0
             prev = cur
+        if stable >= 3 and is_shell_idle(cur):
+            completed = True
+            break
 
-        cur_now = await tmux_capture(window)
-        # インタラクティブダイアログ検出: 1秒安定で早期リターン → Discordに通知
-        if stable >= 2 and is_waiting_for_input(cur_now):
-            return cur
-        # アイドル判定は現在画面のみ（scrollback の古い ⎿  $ を除外するため）
-        if stable >= 6 and is_idle(cur_now):
-            return cur
+    after = await tmux_capture(window, scrollback=2000)
+    out = line_diff(before, after)
+    if not completed:
+        out = (out or "") + f"\n…（{SHELL_TIMEOUT}秒経過してもプロンプトに戻りません。実行中の可能性があります）"
+    await update_status(status_msg, "✅" if completed else "⚠️ 継続中")
+    if out.strip():
+        await send_result(message, out)
+    else:
+        await safe_reply(message, "（出力なし）")
 
-    return prev
+
+async def run_claude_message(window: int, message: discord.Message,
+                             status_msg: discord.Message | None, content: str) -> None:
+    """
+    Claude ペイン: 送信 → セッション JSONL をバインド（キャッシュ優先）→
+    「画面が busy でない ∧ JSONL 末尾にターン完了テキストがある」まで待機 → 全文返信。
+    途中経過は Discord に送らない（ステータス編集のみ）。
+    """
+    cmd, cwd = await pane_info(window)
+    jsonl_dir = _jsonl_dir_for_cwd(cwd) if cwd else None
+    known_sizes: dict[str, int] = {}
+    if jsonl_dir:
+        known_sizes = await asyncio.to_thread(_scan_jsonl_dir_sync, jsonl_dir)
+
+    send_time = time.time()
+    await tmux_send(window, content)
+
+    # JSONL バインド: 前回のファイルを最優先で確認（Claude 再起動まで同じファイル）
+    jsonl_path = None
+    jsonl_offset = 0
+    cached = window_jsonl.get(window)
+    if jsonl_dir:
+        if cached and os.path.exists(cached):
+            bind = await asyncio.to_thread(
+                _find_session_jsonl_sync, jsonl_dir, content, known_sizes,
+                send_time, 8.0, cached
+            )
+            if bind:
+                jsonl_path, jsonl_offset = bind
+        if not jsonl_path:
+            bind = await asyncio.to_thread(
+                _find_session_jsonl_sync, jsonl_dir, content, known_sizes, send_time, 15.0
+            )
+            if bind:
+                jsonl_path, jsonl_offset = bind
+                window_jsonl[window] = jsonl_path
+    if not jsonl_path:
+        print(f"[worker] win={window} jsonl bind failed, pane-fallback mode", flush=True)
+
+    start = time.monotonic()
+    last_status = start
+    dialog_stable = 0
+    idle_stable = 0
+
+    while time.monotonic() - start < CLAUDE_TIMEOUT:
+        await asyncio.sleep(1.0)
+        pane = await tmux_capture(window)
+
+        # 確認ダイアログ（ツール実行許可など）→ 画面を通知して人の入力を待つ
+        if is_waiting_for_input(pane):
+            dialog_stable += 1
+            if dialog_stable >= 2:
+                await update_status(status_msg, "⏸️ 入力待ち")
+                await send_result(message, truncate(strip_ansi(pane)) +
+                                  "\n\n（入力待ちです。`!key` / `!enter` で応答できます）")
+                return
+            continue
+        dialog_stable = 0
+
+        if is_claude_busy(pane):
+            idle_stable = 0
+            now = time.monotonic()
+            if now - last_status >= STATUS_INTERVAL:
+                await update_status(status_msg, f"⏳ 実行中… {int((now - start) // 60)}分経過")
+                last_status = now
+            continue
+
+        # busy でない → JSONL のターン完了テキストを確認
+        idle_stable += 1
+        if jsonl_path:
+            text = await asyncio.to_thread(_read_turn_result_sync, jsonl_path, jsonl_offset)
+            if text:
+                # 直後にツール実行へ進む一瞬の non-busy を誤検出しないよう再確認
+                await asyncio.sleep(1.5)
+                pane2 = await tmux_capture(window)
+                if is_claude_busy(pane2):
+                    idle_stable = 0
+                    continue
+                text2 = await asyncio.to_thread(_read_turn_result_sync, jsonl_path, jsonl_offset)
+                await update_status(status_msg, f"✅ 完了（{int(time.monotonic() - start)}秒）")
+                await send_result(message, text2 or text)
+                return
+            # busy でもなくテキストも来ない状態が続く → /コマンド等の画面内完結操作
+            if idle_stable >= 15:
+                out = truncate(strip_ansi(await tmux_capture(window, scrollback=50)))
+                await update_status(status_msg, "✅")
+                await send_result(message, out if out.strip() else "（出力なし）")
+                return
+        else:
+            # バインド失敗時: busy→idle の遷移を10秒安定で確認して画面末尾を返す
+            if idle_stable >= 10:
+                out = truncate(strip_ansi(await tmux_capture(window, scrollback=200)), 3600)
+                await update_status(status_msg, "✅（画面キャプチャ）")
+                await send_result(message, out if out.strip() else "（出力なし）")
+                return
+
+    await update_status(status_msg, "⏰ タイムアウト")
+    await safe_reply(
+        message,
+        f"{CLAUDE_TIMEOUT // 60}分経過しても完了を検出できませんでした。"
+        "まだ実行中の可能性があります。`!cap` で現在の画面を確認してください。"
+    )
 
 
 # ── window worker（1ウィンドウ1件ずつ順番に処理）─────────────
@@ -447,122 +497,41 @@ async def wait_for_completion(window: int, timeout: int = 300) -> str:
 async def _window_worker(window: int) -> None:
     q = window_queues[window]
     while not q.empty():
-        message, kind, content = await q.get()
+        message, kind, content, status_msg = await q.get()
         print(f"[worker] win={window} dequeue kind={kind}: {repr(content[:40])}", flush=True)
 
-        if kind == "enter":
-            # !enter: 通常メッセージと同じキューに乗せることで、直前の送信中テキストの
-            # Enter より先にこの Enter が tmux に届いてしまう競合を防ぐ
-            await asyncio.to_thread(
-                subprocess.run, ["tmux", "send-keys", "-t", f"{TMUX_SESSION}:{window}", "Enter"]
-            )
-            await asyncio.sleep(2.5)
-            out = truncate(strip_ansi(await tmux_capture(window, scrollback=50)))
-            await safe_reply(message, f"```\n{out}\n```")
-            continue
-
-        if kind == "key":
-            await asyncio.to_thread(
-                subprocess.run, ["tmux", "send-keys", "-t", f"{TMUX_SESSION}:{window}", content]
-            )
-            await asyncio.sleep(0.5)
-            out = truncate(strip_ansi(await tmux_capture(window)))
-            await safe_reply(message, f"```\n{out}\n```")
-            continue
-
-        # 送信前: ディレクトリ内の全 JSONL ファイルとサイズをスナップショット
-        jsonl_path = None
-        jsonl_offset = 0
-        jsonl_dir = None
-        known_sizes: dict[str, int] = {}
         try:
-            cwd = await asyncio.to_thread(_get_pane_cwd_sync, window)
-            jsonl_dir = _jsonl_dir_for_cwd(cwd)
-            known_sizes = await asyncio.to_thread(_scan_jsonl_dir_sync, jsonl_dir)
-        except Exception as e:
-            print(f"[worker] win={window} pre_err: {e}", flush=True)
-
-        send_time = time.time()
-        try:
-            await tmux_send(window, content)
-        except subprocess.CalledProcessError as e:
-            print(f"[worker] win={window} send_error: {e}", flush=True)
-            try:
-                await safe_reply(message,f"tmux送信エラー: {e}")
-            except Exception:
-                pass
-            continue
-
-        try:
-            result = ""
-
-            # まず JSONL セッションファイルをバインド（最大 8 秒）
-            if jsonl_dir:
-                bind_result = await asyncio.to_thread(
-                    _find_session_jsonl_sync, jsonl_dir, content, known_sizes, send_time
+            if kind == "enter":
+                # !enter: 通常メッセージと同じキューに乗せることで、直前の送信中テキストの
+                # Enter より先にこの Enter が tmux に届いてしまう競合を防ぐ
+                await asyncio.to_thread(
+                    subprocess.run, ["tmux", "send-keys", "-t", f"{TMUX_SESSION}:{window}", "Enter"]
                 )
-                if bind_result:
-                    jsonl_path, jsonl_offset = bind_result
-                else:
-                    print(f"[worker] win={window} jsonl_bind_failed: falling back to capture-pane", flush=True)
+                await asyncio.sleep(2.5)
+                out = truncate(strip_ansi(await tmux_capture(window, scrollback=50)))
+                await safe_reply(message, f"```\n{out}\n```")
+                continue
 
-            if jsonl_path:
-                # JSONL ポーリング: 最終 assistant エントリ（tool_use なし）が来るまで待つ
-                # 最大 120 秒、0.5 秒ごとに確認
-                for _ in range(240):
-                    await asyncio.sleep(0.5)
-                    # インタラクティブダイアログ検出（ツール実行前の確認など）
-                    try:
-                        pane_raw = await tmux_capture(window)
-                        if is_waiting_for_input(pane_raw):
-                            result = truncate(strip_ansi(pane_raw))
-                            print(f"[worker] win={window} interactive dialog detected during jsonl poll", flush=True)
-                            break
-                    except Exception:
-                        pass
-                    # JSONL から最終エントリを確認
-                    try:
-                        text, is_final = await asyncio.to_thread(
-                            _read_final_assistant_text_since, jsonl_path, jsonl_offset
-                        )
-                        if text and is_final:
-                            result = text
-                            print(f"[worker] win={window} jsonl final entry {len(result)} chars", flush=True)
-                            break
-                    except Exception:
-                        pass
-                else:
-                    print(f"[worker] win={window} jsonl poll timeout", flush=True)
+            if kind == "key":
+                await asyncio.to_thread(
+                    subprocess.run, ["tmux", "send-keys", "-t", f"{TMUX_SESSION}:{window}", content]
+                )
+                await asyncio.sleep(0.5)
+                out = truncate(strip_ansi(await tmux_capture(window)))
+                await safe_reply(message, f"```\n{out}\n```")
+                continue
 
-            # JSONL が使えない or 空 → capture-pane フォールバック
-            if not result:
-                await wait_for_completion(window)
-                raw = await tmux_capture(window, scrollback=100)
-                print(f"[worker] win={window} pane fallback {len(raw)} chars", flush=True)
-                if is_waiting_for_input(raw):
-                    result = truncate(strip_ansi(raw))
-                    print(f"[worker] win={window} interactive dialog, sending pane", flush=True)
-                else:
-                    result = extract_final_result(raw)
-                    if result and STARTUP_RE.search(result):
-                        print(f"[worker] win={window} pane result skipped (startup text)", flush=True)
-                        result = ""
-                    else:
-                        print(f"[worker] win={window} pane result {len(result)} chars: {repr(result[:60])}", flush=True)
-
-            if result:
-                chunks = split_chunks(result)
-                print(f"[worker] win={window} sending {len(chunks)} chunk(s)", flush=True)
-                await safe_reply(message,f"```\n{chunks[0]}\n```")
-                for chunk in chunks[1:]:
-                    await message.channel.send(f"```\n{chunk}\n```")
+            # 通常テキスト: ペインの実行コマンドでモードを自動判定
+            cmd, _cwd = await pane_info(window)
+            if cmd in SHELL_COMMANDS:
+                await run_shell_command(window, message, status_msg, content)
             else:
-                await safe_reply(message,"（出力なし）")
+                await run_claude_message(window, message, status_msg, content)
         except Exception as e:
             print(f"[worker] win={window} exception: {e}", flush=True)
             import traceback; traceback.print_exc()
             try:
-                await safe_reply(message,f"エラー: {e}")
+                await safe_reply(message, f"エラー: {e}")
             except Exception:
                 pass
 
@@ -629,6 +598,13 @@ def get_thread_window(message: discord.Message) -> int | None:
     return thread_map.get(str(message.channel.id))
 
 
+def enqueue(window: int, item: tuple) -> None:
+    q = window_queues.setdefault(window, asyncio.Queue())
+    q.put_nowait(item)
+    if window not in window_workers or window_workers[window].done():
+        window_workers[window] = asyncio.create_task(_window_worker(window))
+
+
 # ── events ───────────────────────────────────────────────────
 
 @client.event
@@ -652,57 +628,43 @@ async def on_message(message: discord.Message):
         content = message.content.strip()
 
         if content == "!enter":
-            # 直接 subprocess.run せず、通常メッセージと同じ window_queues/_window_worker に
-            # 乗せて同一ウィンドウ内で順番に処理させる（送信中テキストとの競合防止）
-            q = window_queues.setdefault(window, asyncio.Queue())
-            await q.put((message, "enter", ""))
-            if window not in window_workers or window_workers[window].done():
-                window_workers[window] = asyncio.create_task(_window_worker(window))
+            enqueue(window, (message, "enter", "", None))
             return
 
         if content.startswith("!key "):
-            key = content[5:].strip()
-            q = window_queues.setdefault(window, asyncio.Queue())
-            await q.put((message, "key", key))
-            if window not in window_workers or window_workers[window].done():
-                window_workers[window] = asyncio.create_task(_window_worker(window))
+            enqueue(window, (message, "key", content[5:].strip(), None))
             return
 
         if content == "!cap":
             out = truncate(strip_ansi(await tmux_capture(window, scrollback=50)))
-            await safe_reply(message,f"```\n{out}\n```")
+            await safe_reply(message, f"```\n{out}\n```")
             return
 
         if content == "!watch":
             if window in watch_tasks and not watch_tasks[window].done():
-                await safe_reply(message,"すでに監視中です。`!unwatch` で停止。")
+                await safe_reply(message, "すでに監視中です。`!unwatch` で停止。")
                 return
             watch_tasks[window] = asyncio.create_task(
                 watch_loop(window, message.channel)
             )
-            await safe_reply(message,f"ウィンドウ {window} の監視を開始しました。")
+            await safe_reply(message, f"ウィンドウ {window} の監視を開始しました。")
             return
 
         if content == "!unwatch":
             t = watch_tasks.pop(window, None)
             if t:
                 t.cancel()
-                await safe_reply(message,"監視停止しました。")
+                await safe_reply(message, "監視停止しました。")
             else:
-                await safe_reply(message,"監視は動いていません。")
+                await safe_reply(message, "監視は動いていません。")
             return
 
         if content.startswith("!"):
             return
 
         # ── 通常テキスト: キューに追加して順番に処理 ──────────
-        await message.channel.send("⌛️")
-        q = window_queues.setdefault(window, asyncio.Queue())
-        await q.put((message, "text", content))
-
-        # ワーカーがなければ起動
-        if window not in window_workers or window_workers[window].done():
-            window_workers[window] = asyncio.create_task(_window_worker(window))
+        status_msg = await message.channel.send("⌛️")
+        enqueue(window, (message, "text", content, status_msg))
         return
 
     # ── メインチャンネル内メッセージ ─────────────────────────
@@ -714,14 +676,14 @@ async def on_message(message: discord.Message):
     if content == "!setchannel":
         ALLOWED_CHANNEL = str(message.channel.id)
         save_env("DISCORD_CHANNEL_ID", ALLOWED_CHANNEL)
-        await safe_reply(message,"このチャンネルに固定しました。")
+        await safe_reply(message, "このチャンネルに固定しました。")
         return
 
     if content == "!init":
         try:
             wins = tmux_windows()
         except Exception as e:
-            await safe_reply(message,f"tmuxエラー: {e}")
+            await safe_reply(message, f"tmuxエラー: {e}")
             return
 
         created = []
@@ -747,29 +709,29 @@ async def on_message(message: discord.Message):
             created.append(f"w{w['index']}: #{thread.name}")
 
         save_map()
-        await safe_reply(message,"スレッド作成完了:\n" + "\n".join(created))
+        await safe_reply(message, "スレッド作成完了:\n" + "\n".join(created))
         return
 
     if content in ("!windows", "!refresh"):
         try:
             wins = tmux_windows()
         except Exception as e:
-            await safe_reply(message,f"エラー: {e}")
+            await safe_reply(message, f"エラー: {e}")
             return
         lines = []
         for w in wins:
             tid = next((t for t, i in thread_map.items() if i == w["index"]), None)
             link = f"<#{tid}>" if tid else "（スレッドなし）"
             lines.append(f"[{w['index']}] {w['name']} ({w['command']}) → {link}")
-        await safe_reply(message,"\n".join(lines))
+        await safe_reply(message, "\n".join(lines))
         return
 
     if content.startswith("!ai "):
         if not ANTHROPIC_API_KEY:
-            await safe_reply(message,"ANTHROPIC_API_KEY が未設定です。")
+            await safe_reply(message, "ANTHROPIC_API_KEY が未設定です。")
             return
         prompt = content[4:].strip()
-        thinking = await safe_reply(message,"⏳")
+        thinking = await safe_reply(message, "⏳")
         try:
             import anthropic
             ac = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
