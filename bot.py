@@ -98,14 +98,16 @@ async def tmux_capture(window: int, scrollback: int = 0) -> str:
 
 
 def tmux_windows() -> list[dict]:
+    # 区切り文字は window_name / pane_current_command に混入しうる "|" を避け、
+    # 実質衝突しない ASCII unit separator (\x1f) を使う
     result = subprocess.run(
         ["tmux", "list-windows", "-t", TMUX_SESSION, "-F",
-         "#{window_index}|#{window_name}|#{pane_current_command}"],
+         "#{window_index}\x1f#{window_name}\x1f#{pane_current_command}"],
         capture_output=True, text=True,
     )
     windows = []
     for line in result.stdout.strip().splitlines():
-        idx, name, cmd = line.split("|")
+        idx, name, cmd = line.split("\x1f")
         windows.append({"index": int(idx), "name": name, "command": cmd})
     return windows
 
@@ -266,6 +268,9 @@ def _scan_jsonl_dir_sync(directory: str) -> dict[str, int]:
         return {}
 
 
+_jsonl_claimed_size: dict[str, int] = {}
+
+
 def _find_session_jsonl_sync(
     directory: str,
     user_text: str,
@@ -283,18 +288,22 @@ def _find_session_jsonl_sync(
     from datetime import datetime, timezone
 
     deadline = time.monotonic() + timeout
-    match_text = user_text.strip()[:80]  # 最初の80文字でマッチング
+    # 誤マッチ低減のため 80→200 文字に拡大（短い/類似メッセージ同士の取り違え対策）
+    match_text = user_text.strip()[:200]
 
     while time.monotonic() < deadline:
         files = _glob.glob(os.path.join(directory, "*.jsonl"))
         for path in files:
             try:
                 known = known_sizes.get(path, 0)
+                # 同じ cwd を共有する他ウィンドウが既にマッチ済みの範囲は
+                # 再走査対象から除外し、同一エントリの二重マッチを防ぐ
+                scan_from = max(known, _jsonl_claimed_size.get(path, 0))
                 current_size = os.path.getsize(path)
-                if current_size <= known:
+                if current_size <= scan_from:
                     continue
                 with open(path, 'rb') as f:
-                    f.seek(known)
+                    f.seek(scan_from)
                     new_content = f.read().decode('utf-8', errors='replace')
                 for line in new_content.splitlines():
                     try:
