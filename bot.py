@@ -336,6 +336,7 @@ def _find_session_jsonl_sync(
                                 matched = True
                                 break
                         if matched:
+                            _jsonl_claimed_size[path] = current_size
                             print(f"[jsonl] bound {os.path.basename(path)} for text={repr(match_text[:30])}", flush=True)
                             return (path, known)
                     except Exception:
@@ -446,8 +447,28 @@ async def wait_for_completion(window: int, timeout: int = 300) -> str:
 async def _window_worker(window: int) -> None:
     q = window_queues[window]
     while not q.empty():
-        message, content = await q.get()
-        print(f"[worker] win={window} dequeue: {repr(content[:40])}", flush=True)
+        message, kind, content = await q.get()
+        print(f"[worker] win={window} dequeue kind={kind}: {repr(content[:40])}", flush=True)
+
+        if kind == "enter":
+            # !enter: 通常メッセージと同じキューに乗せることで、直前の送信中テキストの
+            # Enter より先にこの Enter が tmux に届いてしまう競合を防ぐ
+            await asyncio.to_thread(
+                subprocess.run, ["tmux", "send-keys", "-t", f"{TMUX_SESSION}:{window}", "Enter"]
+            )
+            await asyncio.sleep(2.5)
+            out = truncate(strip_ansi(await tmux_capture(window, scrollback=50)))
+            await safe_reply(message, f"```\n{out}\n```")
+            continue
+
+        if kind == "key":
+            await asyncio.to_thread(
+                subprocess.run, ["tmux", "send-keys", "-t", f"{TMUX_SESSION}:{window}", content]
+            )
+            await asyncio.sleep(0.5)
+            out = truncate(strip_ansi(await tmux_capture(window)))
+            await safe_reply(message, f"```\n{out}\n```")
+            continue
 
         # 送信前: ディレクトリ内の全 JSONL ファイルとサイズをスナップショット
         jsonl_path = None
@@ -631,18 +652,20 @@ async def on_message(message: discord.Message):
         content = message.content.strip()
 
         if content == "!enter":
-            await asyncio.to_thread(subprocess.run, ["tmux", "send-keys", "-t", f"{TMUX_SESSION}:{window}", "Enter"])
-            await asyncio.sleep(2.5)
-            out = truncate(strip_ansi(await tmux_capture(window, scrollback=50)))
-            await safe_reply(message,f"```\n{out}\n```")
+            # 直接 subprocess.run せず、通常メッセージと同じ window_queues/_window_worker に
+            # 乗せて同一ウィンドウ内で順番に処理させる（送信中テキストとの競合防止）
+            q = window_queues.setdefault(window, asyncio.Queue())
+            await q.put((message, "enter", ""))
+            if window not in window_workers or window_workers[window].done():
+                window_workers[window] = asyncio.create_task(_window_worker(window))
             return
 
         if content.startswith("!key "):
             key = content[5:].strip()
-            await asyncio.to_thread(subprocess.run, ["tmux", "send-keys", "-t", f"{TMUX_SESSION}:{window}", key])
-            await asyncio.sleep(0.5)
-            out = truncate(strip_ansi(await tmux_capture(window)))
-            await safe_reply(message,f"```\n{out}\n```")
+            q = window_queues.setdefault(window, asyncio.Queue())
+            await q.put((message, "key", key))
+            if window not in window_workers or window_workers[window].done():
+                window_workers[window] = asyncio.create_task(_window_worker(window))
             return
 
         if content == "!cap":
@@ -675,7 +698,7 @@ async def on_message(message: discord.Message):
         # ── 通常テキスト: キューに追加して順番に処理 ──────────
         await message.channel.send("⌛️")
         q = window_queues.setdefault(window, asyncio.Queue())
-        await q.put((message, content))
+        await q.put((message, "text", content))
 
         # ワーカーがなければ起動
         if window not in window_workers or window_workers[window].done():
