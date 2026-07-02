@@ -42,13 +42,15 @@ FEEDBACK_RE = re.compile(r'How is Claude doing this session|\d+:\s*(?:Bad|Fine|G
 SHELL_COMMANDS = {"bash", "zsh", "sh", "fish", "dash"}
 
 
-async def safe_reply(message: discord.Message, content: str) -> discord.Message:
-    """system message への reply は Discord が拒否するので channel.send にフォールバック"""
+async def safe_reply(message: discord.Message, content: str, mention: bool = False) -> discord.Message:
+    """system message への reply は Discord が拒否するので channel.send にフォールバック。
+    mention=True で投稿者にプッシュ通知が届く（編集やメンションなし投稿では通知されない）"""
     try:
-        return await message.reply(content)
+        return await message.reply(content, mention_author=mention)
     except discord.HTTPException as e:
         if e.code == 50035:
-            return await message.channel.send(content)
+            prefix = f"{message.author.mention} " if mention else ""
+            return await message.channel.send(prefix + content)
         raise
 
 
@@ -264,12 +266,14 @@ def _find_session_jsonl_sync(
     """
     メッセージ送信後、どのJSONLファイルがそのメッセージを受け取ったかを特定する。
     only_path 指定時はそのファイルだけを確認する（バインドキャッシュの検証用）。
-    戻り値: (path, pre_send_offset) — 送信前のファイルサイズをオフセットとして返す。
+    戻り値: (path, offset) — マッチしたユーザーエントリの「直後」のバイト位置。
+    送信前サイズではなくエントリ直後にすることで、送信先 Claude が前ターン実行中で
+    メッセージがキューされた場合に前ターンの応答を誤って拾わない。
     """
     import glob as _glob
 
     deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
+    while True:
         if only_path:
             files = [only_path]
         else:
@@ -285,19 +289,24 @@ def _find_session_jsonl_sync(
                     continue
                 with open(path, 'rb') as f:
                     f.seek(scan_from)
-                    new_content = f.read().decode('utf-8', errors='replace')
-                for line in new_content.splitlines():
+                    raw = f.read()
+                pos = scan_from
+                for bline in raw.split(b'\n'):
+                    line_len = len(bline) + 1
                     try:
-                        if _entry_matches_user_text(json.loads(line), user_text, send_time):
+                        obj = json.loads(bline.decode('utf-8', errors='replace'))
+                        if _entry_matches_user_text(obj, user_text, send_time):
                             _jsonl_claimed_size[path] = current_size
-                            print(f"[jsonl] bound {os.path.basename(path)} for text={repr(user_text.strip()[:30])}", flush=True)
-                            return (path, known)
+                            print(f"[jsonl] bound {os.path.basename(path)} @ {pos + line_len} for text={repr(user_text.strip()[:30])}", flush=True)
+                            return (path, min(pos + line_len, current_size))
                     except Exception:
                         pass
+                    pos += line_len
             except Exception:
                 pass
+        if time.monotonic() >= deadline:
+            return None
         time.sleep(0.2)
-    return None
 
 
 def _read_turn_result_sync(jsonl_path: str, offset: int) -> str:
@@ -349,9 +358,10 @@ async def update_status(status_msg: discord.Message | None, text: str) -> None:
 
 
 async def send_result(message: discord.Message, text: str) -> None:
+    """最終結果の返信。メンション付き reply でプッシュ通知を発火させる"""
     chunks = split_chunks(text)
     print(f"[worker] sending {len(chunks)} chunk(s), {len(text)} chars", flush=True)
-    await safe_reply(message, f"```\n{chunks[0]}\n```")
+    await safe_reply(message, f"```\n{chunks[0]}\n```", mention=True)
     for chunk in chunks[1:]:
         await message.channel.send(f"```\n{chunk}\n```")
 
@@ -386,7 +396,7 @@ async def run_shell_command(window: int, message: discord.Message,
     if out.strip():
         await send_result(message, out)
     else:
-        await safe_reply(message, "（出力なし）")
+        await safe_reply(message, "（出力なし）", mention=True)
 
 
 async def run_claude_message(window: int, message: discord.Message,
@@ -405,7 +415,9 @@ async def run_claude_message(window: int, message: discord.Message,
     send_time = time.time()
     await tmux_send(window, content)
 
-    # JSONL バインド: 前回のファイルを最優先で確認（Claude 再起動まで同じファイル）
+    # JSONL バインド: 前回のファイルを最優先で確認（Claude 再起動まで同じファイル）。
+    # 送信先が前ターン実行中だとメッセージはキューされ、JSONL への書き込みが
+    # ターン完了後になるため、ここで見つからなくても完了待ちループ内で再試行する。
     jsonl_path = None
     jsonl_offset = 0
     cached = window_jsonl.get(window)
@@ -413,19 +425,19 @@ async def run_claude_message(window: int, message: discord.Message,
         if cached and os.path.exists(cached):
             bind = await asyncio.to_thread(
                 _find_session_jsonl_sync, jsonl_dir, content, known_sizes,
-                send_time, 8.0, cached
+                send_time, 5.0, cached
             )
             if bind:
                 jsonl_path, jsonl_offset = bind
         if not jsonl_path:
             bind = await asyncio.to_thread(
-                _find_session_jsonl_sync, jsonl_dir, content, known_sizes, send_time, 15.0
+                _find_session_jsonl_sync, jsonl_dir, content, known_sizes, send_time, 5.0
             )
             if bind:
                 jsonl_path, jsonl_offset = bind
                 window_jsonl[window] = jsonl_path
     if not jsonl_path:
-        print(f"[worker] win={window} jsonl bind failed, pane-fallback mode", flush=True)
+        print(f"[worker] win={window} jsonl not bound yet, retrying lazily", flush=True)
 
     start = time.monotonic()
     last_status = start
@@ -435,6 +447,15 @@ async def run_claude_message(window: int, message: discord.Message,
     while time.monotonic() - start < CLAUDE_TIMEOUT:
         await asyncio.sleep(1.0)
         pane = await tmux_capture(window)
+
+        # 未バインドなら1パスだけ再走査（キュー済みメッセージは書き込まれ次第拾える）
+        if not jsonl_path and jsonl_dir:
+            bind = await asyncio.to_thread(
+                _find_session_jsonl_sync, jsonl_dir, content, known_sizes, send_time, 0.0
+            )
+            if bind:
+                jsonl_path, jsonl_offset = bind
+                window_jsonl[window] = jsonl_path
 
         # 確認ダイアログ（ツール実行許可など）→ 画面を通知して人の入力を待つ
         if is_waiting_for_input(pane):
@@ -488,7 +509,8 @@ async def run_claude_message(window: int, message: discord.Message,
     await safe_reply(
         message,
         f"{CLAUDE_TIMEOUT // 60}分経過しても完了を検出できませんでした。"
-        "まだ実行中の可能性があります。`!cap` で現在の画面を確認してください。"
+        "まだ実行中の可能性があります。`!cap` で現在の画面を確認してください。",
+        mention=True,
     )
 
 
@@ -531,7 +553,7 @@ async def _window_worker(window: int) -> None:
             print(f"[worker] win={window} exception: {e}", flush=True)
             import traceback; traceback.print_exc()
             try:
-                await safe_reply(message, f"エラー: {e}")
+                await safe_reply(message, f"エラー: {e}", mention=True)
             except Exception:
                 pass
 
@@ -716,7 +738,7 @@ async def on_message(message: discord.Message):
         try:
             wins = tmux_windows()
         except Exception as e:
-            await safe_reply(message, f"エラー: {e}")
+            await safe_reply(message, f"エラー: {e}", mention=True)
             return
         lines = []
         for w in wins:
