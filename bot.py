@@ -92,16 +92,16 @@ def _tmux_capture_sync(window: int, scrollback: int = 0) -> str:
 
 
 def _pane_info_sync(window: int) -> tuple[str, str]:
-    """(pane_current_command, pane_current_path) を返す"""
-    result = subprocess.run(
-        ["tmux", "display-message", "-t", f"{TMUX_SESSION}:{window}", "-p",
-         "#{pane_current_command}\x1f#{pane_current_path}"],
-        capture_output=True, text=True,
-    )
-    parts = result.stdout.strip().split("\x1f")
-    if len(parts) == 2:
-        return parts[0], parts[1]
-    return "", ""
+    """(pane_current_command, pane_current_path) を返す。
+    display-message は非印字文字を \\037 等にエスケープして出力するため、
+    \\x1f 区切りの一括取得は使えない（分割に失敗して ("","") になる）。個別に取得する。"""
+    def q(fmt: str) -> str:
+        r = subprocess.run(
+            ["tmux", "display-message", "-t", f"{TMUX_SESSION}:{window}", "-p", fmt],
+            capture_output=True, text=True,
+        )
+        return r.stdout.strip()
+    return q("#{pane_current_command}"), q("#{pane_current_path}")
 
 
 async def tmux_send(window: int, text: str) -> None:
@@ -117,16 +117,20 @@ async def pane_info(window: int) -> tuple[str, str]:
 
 
 def tmux_windows() -> list[dict]:
-    # 区切り文字は window_name / pane_current_command に混入しうる "|" を避け、
-    # 実質衝突しない ASCII unit separator (\x1f) を使う
+    # 非印字文字の区切りは tmux が "\037" 等にエスケープしてしまうため使えない。
+    # index と command は空白を含まないので、空白区切り+名前を最後（maxsplit）にする
     result = subprocess.run(
         ["tmux", "list-windows", "-t", TMUX_SESSION, "-F",
-         "#{window_index}\x1f#{window_name}\x1f#{pane_current_command}"],
+         "#{window_index} #{pane_current_command} #{window_name}"],
         capture_output=True, text=True,
     )
     windows = []
     for line in result.stdout.strip().splitlines():
-        idx, name, cmd = line.split("\x1f")
+        parts = line.split(None, 2)
+        if len(parts) < 2:
+            continue
+        idx, cmd = parts[0], parts[1]
+        name = parts[2] if len(parts) > 2 else ""
         windows.append({"index": int(idx), "name": name, "command": cmd})
     return windows
 
