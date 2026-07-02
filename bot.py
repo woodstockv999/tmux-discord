@@ -689,7 +689,7 @@ async def on_message(message: discord.Message):
             await safe_reply(message,
                 "このコマンドはスレッド内では使えません。\n"
                 "スレッドで使えるのは `!enter` `!key` `!cap` `!watch` `!unwatch` です。\n"
-                "`!init` `!windows` `!setchannel` `!ai` はメインチャンネルで実行してください。"
+                "`!init` `!windows` `!resync` `!setchannel` `!ai` はメインチャンネルで実行してください。"
             )
             return
 
@@ -755,6 +755,59 @@ async def on_message(message: discord.Message):
             link = f"<#{tid}>" if tid else "（スレッドなし）"
             lines.append(f"[{w['index']}] {w['name']} ({w['command']}) → {link}")
         await safe_reply(message, "\n".join(lines))
+        return
+
+    if content == "!resync":
+        try:
+            wins = sorted(tmux_windows(), key=lambda w: w["index"])
+        except Exception as e:
+            await safe_reply(message, f"tmuxエラー: {e}")
+            return
+
+        # 現在マッピング済みのスレッドを取得（削除済み等はスキップ）
+        threads: list[discord.Thread] = []
+        for tid in thread_map:
+            try:
+                th = client.get_channel(int(tid)) or await client.fetch_channel(int(tid))
+                threads.append(th)
+            except (discord.NotFound, discord.Forbidden):
+                continue
+
+        # スレッドID（作成順=若い順）昇順で、ウィンドウ番号昇順に1対1で振り直す
+        threads.sort(key=lambda t: t.id)
+
+        new_map: dict[str, int] = {}
+        report = []
+        for i, w in enumerate(wins):
+            name = f"w{w['index']} • {w['name']} [{w['command']}]"
+            if i < len(threads):
+                thread = threads[i]
+                old_window = thread_map.get(str(thread.id))
+                await thread.edit(name=name[:100])
+                new_map[str(thread.id)] = w["index"]
+                report.append(f"w{w['index']}: <#{thread.id}>（旧 w{old_window}）")
+            else:
+                thread = await message.channel.create_thread(
+                    name=name[:100],
+                    type=discord.ChannelType.public_thread,
+                    auto_archive_duration=10080,
+                )
+                new_map[str(thread.id)] = w["index"]
+                await thread.send(
+                    f"**ウィンドウ {w['index']} • `{w['command']}`** に接続しました。\n"
+                    f"このスレッドに書くとウィンドウに送信されます。\n"
+                    f"`!cap` = 現在画面  `!watch` / `!unwatch` = 自動監視"
+                )
+                report.append(f"w{w['index']}: <#{thread.id}>（新規作成）")
+
+        orphaned = threads[len(wins):]
+        for thread in orphaned:
+            report.append(f"（対応ウィンドウなし・紐付け解除）: <#{thread.id}>")
+
+        thread_map.clear()
+        thread_map.update(new_map)
+        save_map()
+        await safe_reply(message, "スレッド↔ウィンドウの紐付けを若い順に振り直しました:\n" + "\n".join(report))
         return
 
     if content.startswith("!ai "):
