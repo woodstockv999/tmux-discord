@@ -689,7 +689,7 @@ async def on_message(message: discord.Message):
             await safe_reply(message,
                 "このコマンドはスレッド内では使えません。\n"
                 "スレッドで使えるのは `!enter` `!key` `!cap` `!watch` `!unwatch` です。\n"
-                "`!init` `!windows` `!refresh` `!setchannel` `!ai` はメインチャンネルで実行してください。"
+                "`!init` `!windows` `!setchannel` `!ai` はメインチャンネルで実行してください。"
             )
             return
 
@@ -743,7 +743,7 @@ async def on_message(message: discord.Message):
         await safe_reply(message, "スレッド作成完了:\n" + "\n".join(created))
         return
 
-    if content in ("!windows", "!refresh"):
+    if content == "!windows":
         try:
             wins = tmux_windows()
         except Exception as e:
