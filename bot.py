@@ -686,6 +686,11 @@ async def on_message(message: discord.Message):
             return
 
         if content.startswith("!"):
+            await safe_reply(message,
+                "このコマンドはスレッド内では使えません。\n"
+                "スレッドで使えるのは `!enter` `!key` `!cap` `!watch` `!unwatch` です。\n"
+                "`!init` `!windows` `!refresh` `!setchannel` `!ai` はメインチャンネルで実行してください。"
+            )
             return
 
         # ── 通常テキスト: キューに追加して順番に処理 ──────────
