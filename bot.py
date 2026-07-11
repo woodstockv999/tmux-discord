@@ -565,16 +565,24 @@ async def _window_worker(window: int) -> None:
 # ── watch loop ────────────────────────────────────────────────
 
 async def watch_loop(window: int, thread: discord.Thread):
-    last = await tmux_capture(window)
+    # Claude Code のペインはスピナーと経過タイマー("(2m 33s · …")で2秒ごとに必ず変わるため、
+    # 「前回と違えば送る」だと実行中ずっと2秒に1通投稿し続ける（2026-07-11 の通知連発の原因）。
+    # 実行中(CLAUDE_BUSY_RE)は送らず、出力が落ち着いてから(2回連続で同一)1通だけ送る。
+    last_sent = strip_ansi(await tmux_capture(window))
+    prev = last_sent
     while True:
         await asyncio.sleep(2)
-        cur = await tmux_capture(window)
-        if cur != last:
+        cur = strip_ansi(await tmux_capture(window))
+        if CLAUDE_BUSY_RE.search(cur):
+            prev = None   # 実行中は静観し、落ち着いてから安定判定をやり直す
+            continue
+        settled, prev = cur == prev, cur
+        if settled and cur != last_sent:
             try:
-                await thread.send(f"```\n{truncate(strip_ansi(cur))}\n```")
+                await thread.send(f"```\n{truncate(cur)}\n```")
             except Exception:
                 pass
-            last = cur
+            last_sent = cur
 
 
 # ── .env save ─────────────────────────────────────────────────
